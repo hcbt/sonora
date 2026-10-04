@@ -321,7 +321,10 @@ impl ItemMenu {
         let barren = ids.is_empty();
         let shelf = match imported {
             true => Shelf::Local,
-            false => Shelf::Streaming,
+            false => ids
+                .first()
+                .and_then(|id| Sonora::global(cx).session.read(cx).shelf_for(id))
+                .unwrap_or(Shelf::Local),
         };
         let playlist_menu = self.playlists(Addition::Tracks(ids.clone()), shelf, many, cx);
         let copy = match (many, track.id.clone()) {
@@ -368,7 +371,13 @@ impl ItemMenu {
         );
         // A provider that lists no station tracks gets no station item at all, rather than one
         // that plays the seed and stops.
-        let stations = Sonora::global(cx).session.read(cx).capabilities().radio;
+        let stations = track.id.as_deref().is_some_and(|id| {
+            Sonora::global(cx)
+                .session
+                .read(cx)
+                .capabilities_for(id)
+                .radio
+        });
         let radio = match (many || !stations, track.id.is_some() && track.playable) {
             (true, _) => None,
             (false, true) => {
@@ -389,9 +398,16 @@ impl ItemMenu {
             ),
         };
         let toggle_library = library_toggle(tracks, &library, cx);
-        let membership =
-            (!barren && !imported && Sonora::global(cx).session.read(cx).capabilities().library)
-                .then(|| library_membership(tracks, &library, cx));
+        let membership = (!barren
+            && !imported
+            && ids.first().is_some_and(|id| {
+                Sonora::global(cx)
+                    .session
+                    .read(cx)
+                    .capabilities_for(id)
+                    .library
+            }))
+        .then(|| library_membership(tracks, &library, cx));
 
         let album = match (many, columns.album, track.album_id.clone()) {
             (true, _, _) | (false, true, _) => None,
@@ -667,7 +683,7 @@ fn library_membership(tracks: &[Track], library: &Entity<Library>, cx: &App) -> 
 /// The same for one album, and nothing on a provider whose library is its favorites.
 fn album_membership_item(album: Album, cx: &App) -> Option<MenuItem> {
     let session = Sonora::global(cx).session.read(cx);
-    if !session.capabilities().library || music::is_local_id(&album.id) {
+    if !session.capabilities_for(&album.id).library || music::is_local_id(&album.id) {
         return None;
     }
     let library = Sonora::global(cx).library.clone();
@@ -730,7 +746,11 @@ pub(crate) fn album_menu(
         .submenu(
             menus.playlists(
                 Addition::Album(album_id.clone()),
-                Shelf::of(&album_id),
+                Sonora::global(cx)
+                    .session
+                    .read(cx)
+                    .shelf_for(&album_id)
+                    .unwrap_or(Shelf::Local),
                 true,
                 cx,
             ),
@@ -888,7 +908,7 @@ fn artist_library_item(artist: SavedArtist, cx: &App) -> Option<MenuItem> {
     if !Sonora::global(cx)
         .session
         .read(cx)
-        .capabilities()
+        .capabilities_for(&artist.id)
         .follow_artists
     {
         return None;
@@ -1220,10 +1240,11 @@ fn media_kind(kind: PinKind) -> MediaKind {
 }
 
 fn saved_track(id: &str, cx: &App) -> Option<Track> {
+    let shelf = Sonora::global(cx).session.read(cx).shelf_for(id)?;
     Sonora::global(cx)
         .library
         .read(cx)
-        .state(Shelf::of(id))
+        .state(shelf)
         .tracks()
         .iter()
         .find(|track| track.id.as_deref() == Some(id))
@@ -1232,11 +1253,7 @@ fn saved_track(id: &str, cx: &App) -> Option<Track> {
 
 fn copy_link(kind: MediaKind, id: &str, cx: &mut App) {
     let session = Sonora::global(cx).session.read(cx);
-    let client = match music::is_local_id(id) {
-        true => session.local_client(),
-        false => session.client(),
-    };
-    let Some(client) = client else {
+    let Some(client) = session.client_for(id) else {
         return;
     };
     let Some(url) = client.share_url(kind, id) else {

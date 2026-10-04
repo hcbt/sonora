@@ -289,7 +289,10 @@ impl TrackSource {
         let Some(id) = self.album.as_ref().and_then(|album| album.read(cx).id()) else {
             return Numbering::Listing;
         };
-        if Sonora::global(cx).library.read(cx).shape(Shelf::of(id)) != Shape::Catalog {
+        let Some(shelf) = Sonora::global(cx).session.read(cx).shelf_for(id) else {
+            return Numbering::Listing;
+        };
+        if Sonora::global(cx).library.read(cx).shape(shelf) != Shape::Catalog {
             return Numbering::Listing;
         }
 

@@ -215,10 +215,19 @@ impl DetailView {
                 }
                 match trail.read(cx).can_go_back() {
                     true => router::back(cx),
-                    false => router::navigate(
-                        router::Destination::Library(router::LibraryTab::Playlists),
-                        cx,
-                    ),
+                    false => {
+                        let destination = Sonora::global(cx)
+                            .session
+                            .read(cx)
+                            .slug_for(id)
+                            .filter(|_| !music::is_local_id(id))
+                            .map(|account| router::Destination::Library {
+                                account: account.into(),
+                                tab: router::LibraryTab::Playlists,
+                            })
+                            .unwrap_or(router::Destination::Home);
+                        router::navigate(destination, cx);
+                    }
                 }
             })
             .detach();

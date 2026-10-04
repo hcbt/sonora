@@ -5,7 +5,7 @@ use gpui::{Context, Entity, Task};
 use music::{Genre, GenreDetail, GenreItem, GenreSection};
 use tokio::task::AbortHandle;
 
-use crate::{Io, Session, SessionEvent, join};
+use crate::{Io, Session, SessionEvent, Shelf, join};
 
 pub struct Genres {
     genres: Rc<Vec<Genre>>,
@@ -14,20 +14,15 @@ pub struct Genres {
     session: Entity<Session>,
     io: Io,
     task: Option<Task<()>>,
+    generation: u64,
 }
 
 impl Genres {
     pub fn new(session: Entity<Session>, io: Io, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn => this.load(cx),
-            SessionEvent::SignedOut => {
-                this.task = None;
-                this.genres = Rc::new(Vec::new());
-                this.loading = false;
-                this.error = None;
-                cx.notify();
-            }
-            SessionEvent::Reconnected | SessionEvent::LocalChanged => {}
+            SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) => this.reload(cx),
+            SessionEvent::SignedOut(slug) => this.drop_account(slug, cx),
+            SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -38,6 +33,7 @@ impl Genres {
             session,
             io,
             task: None,
+            generation: 0,
         }
     }
 
@@ -80,23 +76,62 @@ impl Genres {
         if self.loading || !self.genres.is_empty() {
             return;
         }
-        let Some(client) = self.session.read(cx).client() else {
-            return;
-        };
+        self.reload(cx);
+    }
 
-        self.loading = true;
-        self.error = None;
-        cx.notify();
+    fn drop_account(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let before = self.genres.len();
+        Rc::make_mut(&mut self.genres)
+            .retain(|genre| self.session.read(cx).slug_for(&genre.id) != Some(slug));
+        if self.genres.len() != before {
+            cx.notify();
+        }
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let clients = streaming_clients(self.session.read(cx));
+        if clients.is_empty() {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        if self.genres.is_empty() {
+            self.loading = true;
+            self.error = None;
+            cx.notify();
+        }
 
         let io = self.io.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
-            let loaded = join(io.spawn(async move { client.genres().await })).await;
+            let mut merged = Vec::new();
+            let mut failed = None;
+            for client in clients {
+                match join(io.spawn(async move { client.genres().await })).await {
+                    Ok(genres) => merged.extend(genres),
+                    Err(error) => failed = Some(error),
+                }
+            }
 
             this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.loading = false;
-                match crate::settled(loaded, cx) {
-                    Ok(genres) => this.genres = Rc::new(genres),
-                    Err(reason) => this.error = Some(reason),
+                this.task = None;
+                let session = this.session.read(cx);
+                merged.retain(|genre| {
+                    session
+                        .slug_for(&genre.id)
+                        .is_some_and(|slug| session.account_authenticated(slug))
+                });
+                match failed {
+                    Some(error) if merged.is_empty() => {
+                        this.error = Some(crate::settled::<()>(Err(error), cx).unwrap_err());
+                    }
+                    _ => {
+                        this.error = None;
+                        this.genres = Rc::new(merged);
+                    }
                 }
                 cx.notify();
             })
@@ -126,17 +161,29 @@ impl GenreDetails {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn => {
-                if let Some(id) = this.id.clone() {
+            SessionEvent::SignedIn(slug) | SessionEvent::Reconnected(slug) => {
+                let slug = *slug;
+                if let Some(id) = this
+                    .id
+                    .clone()
+                    .filter(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
                     this.clear();
                     this.open(&id, cx);
                 }
             }
-            SessionEvent::SignedOut => {
-                this.clear();
-                cx.notify();
+            SessionEvent::SignedOut(slug) => {
+                let slug = *slug;
+                if this
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
+                    this.clear();
+                    cx.notify();
+                }
             }
-            SessionEvent::Reconnected | SessionEvent::LocalChanged => {}
+            SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -257,4 +304,14 @@ fn pictured(detail: &GenreDetail) -> Option<String> {
             _ => None,
         })
     })
+}
+
+fn streaming_clients(session: &Session) -> Vec<Arc<dyn music::MusicApi>> {
+    let local = session.local_slug();
+    session
+        .active_slugs()
+        .into_iter()
+        .filter(|slug| *slug != local)
+        .filter_map(|slug| session.client_of(Shelf::Account(slug)))
+        .collect()
 }

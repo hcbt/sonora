@@ -40,12 +40,31 @@ pub fn register(lingers: bool, cx: &mut App) {
                 history.update(cx, |history, cx| history.refresh(cx));
             }
             at => {
-                let shelf = match at {
-                    Destination::Local(_) => Shelf::Local,
-                    _ => Shelf::Streaming,
+                let shelves = match &at {
+                    Destination::Local(_) => vec![Shelf::Local],
+                    Destination::Library { account, .. } => Sonora::global(cx)
+                        .session
+                        .read(cx)
+                        .libraries()
+                        .into_iter()
+                        .find(|(slug, _)| *slug == account.as_ref())
+                        .map(|(slug, _)| Shelf::Account(slug))
+                        .into_iter()
+                        .collect(),
+                    _ => Sonora::global(cx)
+                        .session
+                        .read(cx)
+                        .libraries()
+                        .into_iter()
+                        .map(|(slug, _)| Shelf::Account(slug))
+                        .collect(),
                 };
                 let library = Sonora::global(cx).library.clone();
-                library.update(cx, |library, cx| library.refresh(shelf, cx));
+                library.update(cx, |library, cx| {
+                    for shelf in shelves {
+                        library.refresh(shelf, cx);
+                    }
+                });
             }
         },
     );

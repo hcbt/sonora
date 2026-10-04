@@ -12,6 +12,7 @@ mod logging;
 mod lyrics;
 mod mosaic;
 mod network;
+mod owned;
 mod pins;
 mod playback;
 mod potoken;

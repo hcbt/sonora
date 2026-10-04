@@ -3414,10 +3414,10 @@ impl SettingsView {
         let session = self.session.read(cx);
         let signed_out = matches!(session.state(), SessionState::SignedOut);
         let guest = !session.authenticated();
-        let waiting = match session.state() {
-            SessionState::Authorizing(prompt) => !matches!(prompt, Some(SignInPrompt::Accounts(_))),
-            _ => false,
-        };
+        let waiting = !matches!(
+            sign_in_prompt(session),
+            None | Some(SignInPrompt::Accounts(_))
+        );
         let loading = session.is_pending();
         let chosen = self.chosen.filter(|_| loading);
         session
@@ -3719,10 +3719,7 @@ impl SettingsView {
         if self.scrobble_prompt.is_some() {
             return self.close_scrobble(cx);
         }
-        let prompted = matches!(
-            self.session.read(cx).state(),
-            SessionState::Authorizing(Some(_))
-        );
+        let prompted = sign_in_prompt(self.session.read(cx)).is_some();
         if prompted {
             return self.abandon(cx);
         }
@@ -4378,6 +4375,15 @@ fn open_path(path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The prompt a sign-in raised. Adding another account leaves the others signed in, so the
+/// dialog also reads `prompt` when the session state is no longer `Authorizing`.
+fn sign_in_prompt(session: &Session) -> Option<SignInPrompt> {
+    match session.state() {
+        SessionState::Authorizing(Some(prompt)) => Some(prompt.clone()),
+        _ => session.prompt(),
+    }
+}
+
 impl Render for SettingsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let searching = self.searching();
@@ -4437,22 +4443,18 @@ impl Render for SettingsView {
             self.typefaces.sync(false, None, window, cx);
         }
 
-        let accounts = match self.session.read(cx).state() {
-            SessionState::Authorizing(Some(SignInPrompt::Accounts(accounts))) => {
-                Some(accounts.clone())
-            }
+        let prompt = sign_in_prompt(self.session.read(cx));
+        let accounts = match &prompt {
+            Some(SignInPrompt::Accounts(accounts)) => Some(accounts.clone()),
             _ => None,
         };
         if self.sign_in_running && !self.session.read(cx).is_pending() {
             self.sign_in_running = false;
             self.sign_in_for = None;
         }
-        let manual_secret = self.manual_secret.filter(|_| {
-            matches!(
-                self.session.read(cx).state(),
-                SessionState::Authorizing(Some(SignInPrompt::Secret))
-            )
-        });
+        let manual_secret = self
+            .manual_secret
+            .filter(|_| matches!(prompt, Some(SignInPrompt::Secret)));
 
         // only one of these is ever up: a prompt the sign-in raised hides the choice behind
         // it, and the choice holds the veil until that prompt arrives

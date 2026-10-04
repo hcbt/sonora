@@ -23,9 +23,11 @@ impl Cover {
     ) -> Self {
         cx.observe(&playback, |this, _, cx| this.follow(cx))
             .detach();
-        cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedOut => this.forget(cx),
-            SessionEvent::SignedIn | SessionEvent::Reconnected | SessionEvent::LocalChanged => {}
+        cx.subscribe(&session, |this, _session, event, cx| match event {
+            SessionEvent::SignedOut(slug) => this.forget(slug, cx),
+            SessionEvent::SignedIn(_)
+            | SessionEvent::Reconnected(_)
+            | SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -51,11 +53,22 @@ impl Cover {
             .filter(|_| self.album.as_deref() == Some(album))
     }
 
-    fn forget(&mut self, cx: &mut Context<Self>) {
+    fn forget(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let current = self
+            .album
+            .as_deref()
+            .is_some_and(|id| self.session.read(cx).slug_for(id) == Some(slug));
+        self.cache
+            .retain(|id, _| self.session.read(cx).slug_for(id) != Some(slug));
+        if !current {
+            if self.large.as_deref().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         self.task = None;
         self.album = None;
         self.large = None;
-        self.cache.clear();
         cx.notify();
     }
 
@@ -83,12 +96,7 @@ impl Cover {
     }
 
     fn load(&mut self, id: String, cx: &mut Context<Self>) {
-        let session = self.session.read(cx);
-        let client = match music::is_local_id(&id) {
-            true => session.local_client(),
-            false => session.client(),
-        };
-        let Some(client) = client else {
+        let Some(client) = self.session.read(cx).client_for(&id) else {
             return;
         };
 

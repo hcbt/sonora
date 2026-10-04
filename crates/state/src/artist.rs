@@ -36,19 +36,28 @@ impl ArtistDetail {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn => {
-                if let Some(id) = this.id.clone().filter(|id| !music::is_local_id(id)) {
+            SessionEvent::SignedIn(slug) | SessionEvent::Reconnected(slug) => {
+                let slug = *slug;
+                if let Some(id) = this
+                    .id
+                    .clone()
+                    .filter(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
                     this.clear();
                     this.open(&id, cx);
                 }
             }
-            SessionEvent::SignedOut => {
-                if !this.id.as_deref().is_some_and(music::is_local_id) {
+            SessionEvent::SignedOut(slug) => {
+                let slug = *slug;
+                if this
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
                     this.clear();
                     cx.notify();
                 }
             }
-            SessionEvent::Reconnected => {}
             SessionEvent::LocalChanged => {
                 if let Some(id) = this.id.clone().filter(|id| music::is_local_id(id)) {
                     this.clear();

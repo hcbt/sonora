@@ -105,13 +105,14 @@ impl ArtistView {
         let saved = settings.read(cx).table(SECTION);
         let sorting = settings.read(cx).sorting(SECTION);
         let mode = settings.read(cx).view_or(SECTION, Mode::List);
-        let columns = crate::shared::tracks::artist_columns(
-            Sonora::global(cx)
-                .session
-                .read(cx)
-                .capabilities()
-                .playcounts,
-        );
+        let columns =
+            crate::shared::tracks::artist_columns(detail.read(cx).id().is_some_and(|id| {
+                Sonora::global(cx)
+                    .session
+                    .read(cx)
+                    .capabilities_for(id)
+                    .playcounts
+            }));
         let scroll = scrollbar.read(cx).scroll().clone();
         let shown = Rc::new(Cell::new(LISTED));
         let table = cx.new(|cx| {
@@ -346,13 +347,13 @@ impl ArtistView {
 
     fn favorite_button(&self, cx: &App) -> Option<Button> {
         let theme = *cx.theme();
-        // A provider with no followed artists has nothing for this to toggle.
-        if !Sonora::global(cx)
-            .session
-            .read(cx)
-            .capabilities()
-            .follow_artists
-        {
+        if !self.detail.read(cx).id().is_some_and(|id| {
+            Sonora::global(cx)
+                .session
+                .read(cx)
+                .capabilities_for(id)
+                .follow_artists
+        }) {
             return None;
         }
         let library = Sonora::global(cx).library.clone();

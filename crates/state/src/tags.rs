@@ -63,11 +63,7 @@ impl Tags {
             return;
         };
         let session = self.session.read(cx);
-        let picked = match music::is_local_id(&id) {
-            true => session.local_client(),
-            false => session.client(),
-        };
-        let Some(client) = picked else {
+        let Some(client) = session.client_for(&id) else {
             return;
         };
 
@@ -139,12 +135,7 @@ impl Tags {
     }
 
     fn client(&self, cx: &Context<Self>) -> Option<Arc<dyn MusicApi>> {
-        let id = self.track.as_ref()?.id.as_deref();
-        let local = id.is_some_and(music::is_local_id);
-        let session = self.session.read(cx);
-        match local {
-            true => session.local_client(),
-            false => session.client(),
-        }
+        let id = self.track.as_ref()?.id.as_deref()?;
+        self.session.read(cx).client_for(id)
     }
 }

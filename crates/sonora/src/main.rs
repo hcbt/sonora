@@ -21,7 +21,7 @@ use gpui::{
     WindowOptions, point, px, size,
 };
 use music::LyricsProvider;
-use router::Screen;
+use router::{Destination, Screen};
 use state::Sonora;
 use ui::ActiveTheme as _;
 use ui::ThemeKind;
@@ -128,11 +128,28 @@ fn main() {
         #[cfg(target_os = "windows")]
         state::install_rounded_window_hook(set_corner_preference, cx);
         let opened_a_destination = opened_start.is_some();
-        let start = opened_start.unwrap_or_else(|| {
+        if let Some(opened) = &opened_start {
+            claim_spotify(opened, cx);
+        }
+        let start = opened_start.clone().unwrap_or_else(|| {
             let startup = Sonora::global(cx).settings.read(cx).startup().to_owned();
-            Screen::from_id(&startup)
-                .unwrap_or(Screen::Home)
-                .destination()
+            let screen = Screen::from_id(&startup).unwrap_or(Screen::Home);
+            match screen.library_tab() {
+                Some(tab) => {
+                    let account = Sonora::global(cx)
+                        .session
+                        .read(cx)
+                        .stored_libraries()
+                        .into_iter()
+                        .next()
+                        .unwrap_or("spotify");
+                    Destination::Library {
+                        account: account.into(),
+                        tab,
+                    }
+                }
+                None => screen.destination(),
+            }
         });
         router::init(start, cx);
         let (look, overrides, language, pack, stillness, pace, remembered) = {
@@ -500,6 +517,18 @@ unsafe extern "system" fn work_area(
 #[cfg(not(target_os = "windows"))]
 fn platform_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
     None
+}
+
+fn claim_spotify(destination: &router::Destination, cx: &mut gpui::App) {
+    let id = match destination {
+        router::Destination::Album(id)
+        | router::Destination::Song(id)
+        | router::Destination::Playlist(id)
+        | router::Destination::Artist(id)
+        | router::Destination::User(id) => id.as_ref(),
+        _ => return,
+    };
+    Sonora::global(cx).session.read(cx).own("spotify", id);
 }
 
 #[cfg(test)]

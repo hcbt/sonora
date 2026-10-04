@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -360,9 +360,10 @@ pub struct Playback {
     position: Duration,
     clock: LiveClock,
     track: Option<Track>,
-    engine: Option<Box<dyn Player>>,
+    engines: HashMap<&'static str, Box<dyn Player>>,
     local_engine: Option<Box<dyn Player>>,
     session: Entity<Session>,
+    owned: crate::owned::Owned,
     queue: Entity<Queue>,
     settings: Entity<AppSettings>,
     level: f32,
@@ -381,7 +382,7 @@ pub struct Playback {
     /// Continuations in a row that brought no track the queue had not already heard.
     dry: u8,
     /// The streaming engine's event pump; dropping it stops listening.
-    task: Option<Task<()>>,
+    tasks: HashMap<&'static str, Task<()>>,
     local_task: Option<Task<()>>,
     /// The pending load, held through its debounce; a newer load cancels it.
     load: Option<Task<()>>,
@@ -439,20 +440,20 @@ impl Playback {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, session, event, cx| match event {
-            SessionEvent::SignedIn => {
-                let Some(playback) = session.read(cx).playback() else {
+            SessionEvent::SignedIn(slug) => {
+                let Some(playback) = session.read(cx).playback_of(slug) else {
                     return;
                 };
-                this.start_engine(playback, cx);
+                this.start_engine(slug, playback, cx);
                 this.adopt(cx);
             }
-            SessionEvent::Reconnected => {
-                let Some(playback) = session.read(cx).playback() else {
+            SessionEvent::Reconnected(slug) => {
+                let Some(playback) = session.read(cx).playback_of(slug) else {
                     return;
                 };
-                this.rebind(playback, cx);
+                this.rebind(slug, playback, cx);
             }
-            SessionEvent::SignedOut => this.teardown(cx),
+            SessionEvent::SignedOut(slug) => this.drop_engine(slug, cx),
             SessionEvent::LocalChanged => {
                 if this.local_engine.is_none()
                     && let Some(playback) = session.read(cx).local_playback()
@@ -477,15 +478,17 @@ impl Playback {
         );
         let repeat = settings.read(cx).repeat();
         let radio = settings.read(cx).radio();
+        let owned = session.read(cx).owned();
 
         let mut playback = Self {
             state: PlaybackState::Idle,
             position: Duration::ZERO,
             clock: LiveClock::new(),
             track: None,
-            engine: None,
+            engines: HashMap::new(),
             local_engine: None,
             session,
+            owned,
             queue,
             settings,
             level,
@@ -498,7 +501,7 @@ impl Playback {
             station: None,
             topping: None,
             dry: 0,
-            task: None,
+            tasks: HashMap::new(),
             local_task: None,
             load: None,
             fetch: None,
@@ -540,7 +543,11 @@ impl Playback {
     fn engine_for(&self, id: &str) -> Option<&dyn Player> {
         match music::is_local_id(id) {
             true => self.local_engine.as_deref(),
-            false => self.engine.as_deref(),
+            false => self
+                .owned
+                .slug(id)
+                .and_then(|slug| self.engines.get(slug))
+                .map(|engine| engine.as_ref()),
         }
     }
 
@@ -557,14 +564,21 @@ impl Playback {
         Some(spectrum)
     }
 
-    /// Pauses the engine the new track does not belong to, so the two never sound at once.
+    /// Pauses every engine the new track does not belong to, so two accounts never sound at once.
     fn silence_other(&self, id: &str) {
-        let other = match music::is_local_id(id) {
-            true => self.engine.as_deref(),
-            false => self.local_engine.as_deref(),
+        let keep = match music::is_local_id(id) {
+            true => None,
+            false => self.owned.slug(id),
         };
-        if let Some(engine) = other {
+        if keep.is_some()
+            && let Some(engine) = self.local_engine.as_deref()
+        {
             engine.pause();
+        }
+        for (slug, engine) in &self.engines {
+            if Some(*slug) != keep {
+                engine.pause();
+            }
         }
     }
 
@@ -1091,21 +1105,14 @@ impl Playback {
     }
 
     fn client_for(&self, id: &str, cx: &Context<Self>) -> Option<Arc<dyn MusicApi>> {
-        let session = self.session.read(cx);
-        match music::is_local_id(id) {
-            true => session.local_client(),
-            false => session.client(),
-        }
+        self.session.read(cx).client_for(id)
     }
 
     /// Whether the provider that owns `id` can seed a station. Without one there is nothing to
     /// keep a queue going, so the radio paths leave it alone rather than asking and getting
     /// nothing back.
     fn stations(&self, id: &str, cx: &Context<Self>) -> bool {
-        self.session
-            .read(cx)
-            .capabilities_of(crate::Shelf::of(id))
-            .radio
+        self.session.read(cx).capabilities_for(id).radio
     }
 
     /// Fetches tracks for the queue on the tokio runtime and places them on arrival. One fetch
@@ -1728,24 +1735,58 @@ impl Playback {
         cx.notify();
     }
 
+    fn provider_label(&self, cx: &App) -> String {
+        self.track
+            .as_ref()
+            .and_then(|track| track.id.as_deref())
+            .and_then(|id| self.owned.slug(id))
+            .and_then(|slug| self.session.read(cx).name_of(slug))
+            .unwrap_or("this provider")
+            .to_owned()
+    }
+
     /// Restores the last session's track and queue from settings, paused where it stopped.
     /// Only when nothing is playing or queued, and only for the provider that saved it.
     fn adopt(&mut self, cx: &mut Context<Self>) {
         if self.track.is_some() || !self.queue.read(cx).is_empty() {
             return;
         }
-        let Some(slug) = self.session.read(cx).provider_slug() else {
+        let Some(resume) = self.settings.read(cx).resume().cloned() else {
             return;
         };
-        let Some(resume) = self
-            .settings
+        let Some(slug) = self
+            .session
             .read(cx)
-            .resume()
-            .filter(|resume| resume.provider == slug)
-            .cloned()
+            .stored_libraries()
+            .into_iter()
+            .find(|known| *known == resume.provider)
         else {
             return;
         };
+        if self.session.read(cx).playback_of(slug).is_none() {
+            return;
+        }
+        {
+            let session = self.session.read(cx);
+            for stub in resume
+                .current
+                .iter()
+                .chain(resume.past.iter())
+                .chain(resume.upcoming.iter())
+            {
+                let owner = stub.provider.as_deref().and_then(|name| {
+                    session
+                        .stored_libraries()
+                        .into_iter()
+                        .find(|known| *known == name)
+                });
+                let owner = owner.unwrap_or(slug);
+                session.own(owner, &stub.id);
+                if let Some(id) = &stub.album_id {
+                    session.own(owner, id);
+                }
+            }
+        }
 
         let at = Duration::from_secs_f32(resume.position.max(0.));
         let Some(track) = self.queue.update(cx, |queue, cx| queue.revive(resume, cx)) else {
@@ -2011,7 +2052,7 @@ impl Playback {
         self.settings
             .update(cx, |settings, cx| settings.set_volume(self.level, cx));
         let level = gain(self.level);
-        if let Some(engine) = self.engine.as_ref() {
+        for engine in self.engines.values() {
             engine.set_gain(level);
         }
         if let Some(engine) = self.local_engine.as_ref() {
@@ -2093,17 +2134,30 @@ impl Playback {
     /// Rebuilds the streaming engine after a setting it was configured with changed, resuming
     /// where it was unless a local track is playing.
     fn restart_engine(&mut self, cx: &mut Context<Self>) {
-        let playback = match self.engine.is_some() {
-            true => self.session.read(cx).playback(),
-            false => None,
-        };
-        let Some(playback) = playback else {
-            return cx.notify();
-        };
-
-        match self.local_active() {
-            true => self.start_engine(playback, cx),
-            false => self.rebind(playback, cx),
+        let slugs: Vec<&'static str> = self.engines.keys().copied().collect();
+        for slug in slugs {
+            let Some(playback) = self.session.read(cx).playback_of(slug) else {
+                continue;
+            };
+            let current = self
+                .track
+                .as_ref()
+                .and_then(|track| track.id.as_deref())
+                .and_then(|id| self.owned.slug(id));
+            if current == Some(slug) && !self.local_active() {
+                self.rebind(slug, playback, cx);
+            } else {
+                self.tasks.remove(slug);
+                self.engines.remove(slug);
+                self.start_engine(slug, playback, cx);
+            }
+        }
+        if self.local_engine.is_some()
+            && let Some(playback) = self.session.read(cx).local_playback()
+        {
+            self.local_task = None;
+            self.local_engine = None;
+            self.start_local_engine(playback, cx);
         }
     }
 
@@ -2113,31 +2167,29 @@ impl Playback {
         let Some(track) = self.track.clone() else {
             return;
         };
-        let Some(id) = track.id.as_deref() else {
+        let Some(id) = track.id.clone() else {
             return;
         };
         let at = self.live_position();
-        let local = music::is_local_id(id);
-        let playback = match local {
-            true => self.session.read(cx).local_playback(),
-            false => self.session.read(cx).playback(),
-        };
-        let Some(playback) = playback else {
-            return;
-        };
-
+        let local = music::is_local_id(&id);
         log::info!("playback: restarting after the audio output changed");
-        match local {
-            true => {
-                self.local_task = None;
-                self.local_engine = None;
-                self.start_local_engine(playback, cx);
-            }
-            false => {
-                self.task = None;
-                self.engine = None;
-                self.start_engine(playback, cx);
-            }
+        if local {
+            let Some(playback) = self.session.read(cx).local_playback() else {
+                return;
+            };
+            self.local_task = None;
+            self.local_engine = None;
+            self.start_local_engine(playback, cx);
+        } else {
+            let Some(slug) = self.owned.slug(&id) else {
+                return;
+            };
+            let Some(playback) = self.session.read(cx).playback_of(slug) else {
+                return;
+            };
+            self.tasks.remove(slug);
+            self.engines.remove(slug);
+            self.start_engine(slug, playback, cx);
         }
         self.load_from(&track, at, Start::Pick, cx);
     }
@@ -2156,25 +2208,41 @@ impl Playback {
 
     /// Moves playback onto a fresh engine, as after a reconnect, and resumes where it was if it
     /// was playing or waiting to.
-    fn rebind(&mut self, playback: Arc<dyn PlaybackFactory>, cx: &mut Context<Self>) {
-        let resume = self.state == PlaybackState::Playing || self.awaiting_reconnect;
+    fn rebind(
+        &mut self,
+        slug: &'static str,
+        playback: Arc<dyn PlaybackFactory>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self
+            .track
+            .as_ref()
+            .and_then(|track| track.id.as_deref())
+            .and_then(|id| self.owned.slug(id));
+        let resume = current == Some(slug)
+            && (self.state == PlaybackState::Playing || self.awaiting_reconnect);
         self.awaiting_reconnect = false;
         let at = self.position;
-        self.task = None;
-        self.engine = None;
+        self.tasks.remove(slug);
+        self.engines.remove(slug);
         self.preloaded = None;
         self.blocked_until = None;
-        if self.track.is_some() {
+        if current == Some(slug) && self.track.is_some() {
             self.resume_at = Some(at);
         }
-        self.start_engine(playback, cx);
+        self.start_engine(slug, playback, cx);
         if resume {
             self.resume(cx);
         }
     }
 
-    /// Builds the streaming engine and starts pumping its events.
-    fn start_engine(&mut self, playback: Arc<dyn PlaybackFactory>, cx: &mut Context<Self>) {
+    /// Builds one account's engine and starts pumping its events.
+    fn start_engine(
+        &mut self,
+        slug: &'static str,
+        playback: Arc<dyn PlaybackFactory>,
+        cx: &mut Context<Self>,
+    ) {
         let config = PlaybackConfig {
             normalisation: self.normalisation,
             gapless: self.gapless,
@@ -2184,10 +2252,10 @@ impl Playback {
         };
         let (engine, events) = playback.start(config);
 
-        self.listen(events, false, cx);
-        self.engine = Some(engine);
+        self.listen(events, Some(slug), cx);
+        self.engines.insert(slug, engine);
         self.refused = None;
-        if !self.local_active() {
+        if self.track.is_none() {
             self.state = PlaybackState::Idle;
             self.position = Duration::ZERO;
             self.clock.reset(Duration::ZERO, false);
@@ -2206,34 +2274,53 @@ impl Playback {
         };
         let (engine, events) = playback.start(config);
 
-        self.listen(events, true, cx);
+        self.listen(events, None, cx);
         self.local_engine = Some(engine);
         self.prepare_resume(cx);
     }
 
-    /// Pumps an engine's events into `on_backend_event` until the engine is dropped.
-    fn listen(&mut self, mut events: Box<dyn PlaybackEvents>, local: bool, cx: &mut Context<Self>) {
-        let task = Some(cx.spawn(async move |this, cx| {
+    /// Pumps an engine's events into `on_backend_event` until the engine is dropped. `None` is
+    /// the local engine.
+    fn listen(
+        &mut self,
+        mut events: Box<dyn PlaybackEvents>,
+        slug: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        let task = cx.spawn(async move |this, cx| {
             while let Some(event) = events.next().await {
                 if this
-                    .update(cx, |this, cx| this.on_backend_event(event, local, cx))
+                    .update(cx, |this, cx| this.on_backend_event(event, slug, cx))
                     .is_err()
                 {
                     break;
                 }
             }
-        }));
-        match local {
-            true => self.local_task = task,
-            false => self.task = task,
+        });
+        match slug {
+            Some(slug) => {
+                self.tasks.insert(slug, task);
+            }
+            None => self.local_task = Some(task),
         }
     }
 
     /// Applies what an engine reports. Events from the engine not playing the current track,
     /// or about another track, are dropped, so a late event from a previous load cannot move
     /// the clock.
-    fn on_backend_event(&mut self, event: BackendEvent, local: bool, cx: &mut Context<Self>) {
-        if local != self.local_active() {
+    fn on_backend_event(
+        &mut self,
+        event: BackendEvent,
+        from: Option<&'static str>,
+        cx: &mut Context<Self>,
+    ) {
+        let current = self.track.as_ref().and_then(|track| track.id.as_deref());
+        let mine = match (from, current) {
+            (None, Some(id)) => music::is_local_id(id),
+            (Some(slug), Some(id)) => !music::is_local_id(id) && self.owned.slug(id) == Some(slug),
+            _ => false,
+        };
+        if !mine {
             return;
         }
         let current_id = self.track.as_ref().and_then(|track| track.id.as_deref());
@@ -2403,11 +2490,15 @@ impl Playback {
 
     /// Drops the streaming engine and everything derived from its session on sign-out. A local
     /// track keeps playing.
-    fn teardown(&mut self, cx: &mut Context<Self>) {
-        self.task = None;
-        self.engine = None;
-
-        if !self.local_active() {
+    fn drop_engine(&mut self, slug: &'static str, cx: &mut Context<Self>) {
+        self.tasks.remove(slug);
+        self.engines.remove(slug);
+        let playing = self
+            .track
+            .as_ref()
+            .and_then(|track| track.id.as_deref())
+            .and_then(|id| self.owned.slug(id));
+        if playing == Some(slug) {
             self.load = None;
             self.fetch = None;
             self.enqueue = None;
@@ -2452,12 +2543,7 @@ impl Playback {
         let Some(track) = self.track.clone() else {
             return;
         };
-        let provider = self
-            .session
-            .read(cx)
-            .provider_name()
-            .unwrap_or("this provider")
-            .to_owned();
+        let provider = self.provider_label(cx);
         let at = self.position;
         self.throttles = self.throttles.saturating_add(1);
         if self.intent == Intent::Pause {
@@ -2500,11 +2586,7 @@ impl Playback {
         self.refused = Some(Refusal::SignIn);
         self.track = None;
         self.blocked_until = None;
-        let provider = self
-            .session
-            .read(cx)
-            .provider_name()
-            .unwrap_or("this provider");
+        let provider = self.provider_label(cx);
         self.state = PlaybackState::Failed(format!(
             "{provider} only streams to a signed-in listener; nothing will play until you sign in"
         ));

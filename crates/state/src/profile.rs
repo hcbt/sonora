@@ -22,17 +22,29 @@ pub struct Profile {
 impl Profile {
     pub fn new(session: Entity<Session>, io: Io, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn => {
-                if let Some(id) = this.id.clone() {
+            SessionEvent::SignedIn(slug) | SessionEvent::Reconnected(slug) => {
+                let slug = *slug;
+                if let Some(id) = this
+                    .id
+                    .clone()
+                    .filter(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
                     this.clear();
                     this.open(&id, cx);
                 }
             }
-            SessionEvent::SignedOut => {
-                this.clear();
-                cx.notify();
+            SessionEvent::SignedOut(slug) => {
+                let slug = *slug;
+                if this
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
+                    this.clear();
+                    cx.notify();
+                }
             }
-            SessionEvent::Reconnected | SessionEvent::LocalChanged => {}
+            SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -80,7 +92,7 @@ impl Profile {
         self.clear();
         self.id = Some(id.to_owned());
 
-        let Some(client) = self.session.read(cx).client() else {
+        let Some(client) = self.session.read(cx).client_for(id) else {
             cx.notify();
             return;
         };
@@ -138,7 +150,10 @@ impl Profile {
 
     fn build_mosaics(&mut self, cx: &mut Context<Self>) {
         let wanted = self.adopt_mosaics();
-        let Some(client) = self.session.read(cx).client() else {
+        let Some(id) = self.id.clone() else {
+            return;
+        };
+        let Some(client) = self.session.read(cx).client_for(&id) else {
             return;
         };
 

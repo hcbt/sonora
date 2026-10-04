@@ -136,7 +136,7 @@ impl Pins {
     fn fingerprint(&self, cx: &App) -> u64 {
         let mut hasher = DefaultHasher::new();
         let library = self.library.read(cx);
-        for shelf in [Shelf::Streaming, Shelf::Local] {
+        for shelf in self.live_shelves(cx) {
             if self.session.read(cx).client_of(shelf).is_none() {
                 continue;
             }
@@ -170,7 +170,7 @@ impl Pins {
         let pinned = self.dragged(cx);
         let library = self.library.read(cx);
         let mut rest = Vec::new();
-        for shelf in [Shelf::Streaming, Shelf::Local] {
+        for shelf in self.live_shelves(cx) {
             if self.session.read(cx).client_of(shelf).is_none() {
                 continue;
             }
@@ -290,6 +290,9 @@ impl Pins {
     /// Mirrors a change into the provider's own pins. Nothing happens for a provider that keeps
     /// none, or for an item it does not carry in its library.
     fn tell(&mut self, pin: &Pin, pinned: bool, cx: &mut Context<Self>) {
+        let Some(slug) = self.session.read(cx).slug_for(&pin.id) else {
+            return;
+        };
         let Some(uri) = self.remote(pin, cx) else {
             return;
         };
@@ -297,6 +300,7 @@ impl Pins {
         let pin = pin.clone();
         self.library.update(cx, |library, cx| {
             library.set_pinned(
+                slug,
                 uri,
                 pinned,
                 move |kept, cx| {
@@ -344,21 +348,32 @@ impl Pins {
     /// one rather than failing on a call it cannot make.
     fn remote(&self, pin: &Pin, cx: &App) -> Option<String> {
         let session = self.session.read(cx);
-        if !session.capabilities().pins || music::is_local_id(&pin.id) {
+        if !session.capabilities_for(&pin.id).pins || music::is_local_id(&pin.id) {
             return None;
         }
-        let listed = self
-            .library
-            .read(cx)
-            .pin_targets()?
+        let targets = self.library.read(cx).pin_targets();
+        let listed = targets
             .iter()
             .find(|item| pin_of(item).is_some_and(|listed| listed.same(pin)))
             .map(|item| item.uri.clone());
         listed.or_else(|| {
             session
-                .client_of(Shelf::Streaming)?
+                .client_for(&pin.id)?
                 .pin_uri(target_kind(pin.kind)?, &pin.id)
         })
+    }
+
+    fn live_shelves(&self, cx: &App) -> Vec<Shelf> {
+        let session = self.session.read(cx);
+        let mut shelves: Vec<Shelf> = session
+            .libraries()
+            .into_iter()
+            .map(|(slug, _)| Shelf::Account(slug))
+            .collect();
+        if session.local_client().is_some() {
+            shelves.push(Shelf::Local);
+        }
+        shelves
     }
 
     /// Follows the provider's own pins: one it pinned elsewhere joins the local list, one it
@@ -369,10 +384,10 @@ impl Pins {
         if self.library.read(cx).pin_pending() {
             return;
         }
-        let Some(items) = self.library.read(cx).pin_targets() else {
-            self.mirrored.clear();
+        let items = self.library.read(cx).pin_targets();
+        if items.is_empty() && self.mirrored.is_empty() {
             return;
-        };
+        }
         let now: Vec<(String, Pin)> = items
             .iter()
             .filter(|item| item.pinned)

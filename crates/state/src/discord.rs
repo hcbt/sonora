@@ -518,7 +518,7 @@ fn buttons(
     let mut buttons = Vec::new();
     if settings.discord_provider_button()
         && let Some((provider, id)) = track
-        && let shelf = Shelf::of(id)
+        && let Some(shelf) = session.shelf_for(id)
         && !matches!(shelf, Shelf::Local)
         && let Some(url) = session
             .client_of(shelf)

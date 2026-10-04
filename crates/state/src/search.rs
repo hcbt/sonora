@@ -1,8 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use gpui::{Context, Entity, Task};
+use gpui::{App, Context, Entity, Task};
 use music::{Album, ArtistRef, Playlist, Track};
 
 use crate::{Io, Library, Network, Session, SessionEvent, Shelf, join};
@@ -142,16 +143,16 @@ impl Search {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedOut => {
+            SessionEvent::SignedOut(_) => {
                 this.forget_results();
                 cx.notify();
             }
-            SessionEvent::SignedIn => {
+            SessionEvent::SignedIn(_) => {
                 let pending = this.query.clone();
                 this.query.clear();
                 this.ask(&pending, cx);
             }
-            SessionEvent::Reconnected | SessionEvent::LocalChanged => {}
+            SessionEvent::Reconnected(_) | SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -208,6 +209,19 @@ impl Search {
         self.loading = false;
         self.error = None;
     }
+    fn clients(&self, cx: &App) -> Vec<Arc<dyn music::MusicApi>> {
+        let session = self.session.read(cx);
+        let mut clients = Vec::new();
+        for (slug, _) in session.libraries() {
+            if let Some(client) = session.client_of(Shelf::Account(slug)) {
+                clients.push(client);
+            }
+        }
+        if let Some(local) = session.local_client() {
+            clients.push(local);
+        }
+        clients
+    }
 
     pub fn ask(&mut self, query: &str, cx: &mut Context<Self>) {
         let query = query.trim().to_owned();
@@ -229,11 +243,12 @@ impl Search {
 
         self.rank(cx);
 
-        let Some(client) = self.session.read(cx).client() else {
+        let clients = self.clients(cx);
+        if clients.is_empty() {
             self.loading = false;
             cx.notify();
             return;
-        };
+        }
 
         self.loading = true;
         cx.notify();
@@ -242,20 +257,33 @@ impl Search {
         self.task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DEBOUNCE).await;
 
-            let songs = {
-                let client = client.clone();
+            let mut songs = Ok(Vec::new());
+            let mut albums = Ok(Vec::new());
+            let mut playlists = Ok(Vec::new());
+            for client in clients {
                 let asked = query.clone();
-                io.spawn(async move { client.search(&asked).await })
-            };
-            let albums = {
-                let client = client.clone();
+                let found = join(io.spawn({
+                    let client = client.clone();
+                    async move { client.search(&asked).await }
+                }))
+                .await;
+                songs = extend_hits(songs, found);
                 let asked = query.clone();
-                io.spawn(async move { client.search_albums(&asked).await })
-            };
-            let asked = query.clone();
-            let playlists = io.spawn(async move { client.search_playlists(&asked).await });
-            let (songs, albums, playlists) =
-                (join(songs).await, join(albums).await, join(playlists).await);
+                let found = join(io.spawn({
+                    let client = client.clone();
+                    async move { client.search_albums(&asked).await }
+                }))
+                .await;
+                albums = extend_hits(albums, found);
+                let asked = query.clone();
+                let found = join(io.spawn({
+                    let client = client.clone();
+                    async move { client.search_playlists(&asked).await }
+                }))
+                .await;
+                playlists = extend_hits(playlists, found);
+            }
+            let (songs, albums, playlists) = (songs, albums, playlists);
 
             this.update(cx, |this, cx| {
                 if this.query != query {
@@ -307,7 +335,8 @@ impl Search {
             return;
         }
 
-        let Some(client) = self.session.read(cx).client() else {
+        let session = self.session.read(cx);
+        let Some(client) = wanted.first().and_then(|id| session.client_for(id)) else {
             return;
         };
 
@@ -339,12 +368,27 @@ impl Search {
         }
 
         self.hits = {
+            let session = self.session.read(cx);
             let held = self.library.read(cx);
-            let state = held.state(Shelf::Streaming);
+            let mut tracks = Vec::new();
+            let mut albums = Vec::new();
+            let mut playlists = Vec::new();
+            for (slug, _) in session.libraries() {
+                let state = held.state(Shelf::Account(slug));
+                tracks.extend(state.tracks().iter().cloned());
+                albums.extend(state.albums().iter().cloned());
+                playlists.extend(state.playlists().iter().cloned());
+            }
+            if session.local_client().is_some() {
+                let state = held.state(Shelf::Local);
+                tracks.extend(state.tracks().iter().cloned());
+                albums.extend(state.albums().iter().cloned());
+                playlists.extend(state.playlists().iter().cloned());
+            }
             rank(
-                state.tracks(),
-                state.albums(),
-                state.playlists(),
+                &tracks,
+                &albums,
+                &playlists,
                 &self.catalog,
                 &self.portraits,
                 query,
@@ -355,6 +399,17 @@ impl Search {
     }
 }
 
+fn extend_hits<T>(kept: Result<Vec<T>>, found: Result<Vec<T>>) -> Result<Vec<T>> {
+    match (kept, found) {
+        (Ok(mut kept), Ok(more)) => {
+            kept.extend(more);
+            Ok(kept)
+        }
+        (Ok(kept), Err(_)) => Ok(kept),
+        (Err(_), Ok(found)) => Ok(found),
+        (Err(error), Err(_)) => Err(error),
+    }
+}
 fn rank(
     library: &[Track],
     albums: &[Album],

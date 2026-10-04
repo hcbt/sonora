@@ -46,6 +46,8 @@ pub struct Stub {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub(crate) credited: Vec<Named>,
     pub(crate) album: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) album_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -93,6 +95,7 @@ fn stub(track: &Track) -> Option<Stub> {
             })
             .collect(),
         album: track.album.clone(),
+        provider: None,
         album_id: track.album_id.clone(),
         cover: track.cover.clone(),
         seconds: track.duration.as_secs_f32(),
@@ -184,6 +187,7 @@ fn record<'a>(
     }
 }
 
+#[cfg(test)]
 fn local(track: &Track) -> bool {
     track.id.as_deref().is_some_and(music::is_local_id)
 }
@@ -350,8 +354,10 @@ impl Queue {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedOut => this.purge(cx),
-            SessionEvent::SignedIn | SessionEvent::Reconnected | SessionEvent::LocalChanged => {}
+            SessionEvent::SignedOut(slug) => this.purge(slug, cx),
+            SessionEvent::SignedIn(_)
+            | SessionEvent::Reconnected(_)
+            | SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -410,20 +416,42 @@ impl Queue {
     }
 
     fn remember(&mut self, cx: &mut Context<Self>) {
-        let resume = self
-            .session
-            .read(cx)
-            .provider_slug()
-            .filter(|_| !self.blank())
-            .map(|slug| {
-                record(
-                    slug,
-                    &self.past,
-                    self.current.as_ref(),
-                    self.upcoming.range(..self.queued()),
-                    self.manual,
-                )
-            });
+        let slug = if self.blank() {
+            None
+        } else {
+            let session = self.session.read(cx);
+            self.current
+                .as_ref()
+                .and_then(|track| track.id.as_deref())
+                .and_then(|id| session.slug_for(id))
+                .or_else(|| {
+                    self.past
+                        .iter()
+                        .chain(self.upcoming.iter())
+                        .find_map(|track| track.id.as_deref().and_then(|id| session.slug_for(id)))
+                })
+        };
+        let mut resume = slug.map(|slug| {
+            record(
+                slug,
+                &self.past,
+                self.current.as_ref(),
+                self.upcoming.range(..self.queued()),
+                self.manual,
+            )
+        });
+        if let Some(resume) = resume.as_mut() {
+            let session = self.session.read(cx);
+            for stub in resume
+                .current
+                .iter_mut()
+                .chain(resume.past.iter_mut())
+                .chain(resume.upcoming.iter_mut())
+            {
+                stub.provider = session.slug_for(&stub.id).map(str::to_owned);
+            }
+        }
+        let resume = resume;
         self.settings
             .update(cx, |settings, cx| settings.set_resume(resume, cx));
     }
@@ -459,23 +487,40 @@ impl Queue {
         self.current().cloned()
     }
 
-    fn purge(&mut self, cx: &mut Context<Self>) {
-        let suggested = self.similar > 0;
-        self.upcoming.truncate(self.queued());
-        self.similar = 0;
-        self.manual = self
+    fn purge(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let owned_ids: HashSet<String> = {
+            let session = self.session.read(cx);
+            self.past
+                .iter()
+                .chain(self.current.as_ref())
+                .chain(self.upcoming.iter())
+                .chain(self.source.iter())
+                .filter_map(|track| track.id.clone())
+                .filter(|id| session.slug_for(id) == Some(slug))
+                .collect()
+        };
+        if owned_ids.is_empty() {
+            return;
+        }
+        let owned = |track: &Track| track.id.as_ref().is_some_and(|id| owned_ids.contains(id));
+        self.manual -= self
             .upcoming
             .range(..self.manual)
-            .filter(|entry| local(&entry.track))
+            .filter(|entry| owned(&entry.track))
+            .count();
+        self.similar -= self
+            .upcoming
+            .range(self.queued()..)
+            .filter(|entry| owned(&entry.track))
             .count();
         let sifted = sift(
             &mut self.past,
             &mut self.current,
             &mut self.upcoming,
             &mut self.source,
-            |entry| local(&entry.track),
+            |entry| !owned(&entry.track),
         );
-        if suggested || sifted {
+        if sifted {
             self.changed(cx);
         }
     }

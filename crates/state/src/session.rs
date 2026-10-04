@@ -13,6 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::Shelf;
 use crate::catalog::CatalogSource;
+use crate::owned::{Owned, OwnedApi};
 use crate::settings::AppSettings;
 use crate::{Io, Network, join};
 
@@ -23,8 +24,8 @@ const BACKOFF: [Duration; 5] = [
     Duration::ZERO,
     Duration::from_secs(5),
     Duration::from_secs(15),
+    Duration::from_secs(30),
     Duration::from_secs(60),
-    Duration::from_secs(300),
 ];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -66,17 +67,18 @@ pub enum SessionState {
     Restoring,
     Authorizing(Option<SignInPrompt>),
     SignedIn(UserProfile),
-    /// The stored account could not be reached. It is still the user's, so nothing is signed
-    /// out: the app stays on whatever the library kept and on the local files, and tries the
-    /// account again by itself once the network is back.
+    /// A stored account could not be reached, and nothing else is live. It is still the user's,
+    /// so nothing is signed out: the app stays on whatever the libraries kept and on the local
+    /// files, and tries the accounts again once the network is back.
     Offline(Failure),
     Failed(Failure),
 }
 
+/// A live account changed. The slug is which one, so another account's library is left alone.
 pub enum SessionEvent {
-    SignedIn,
-    SignedOut,
-    Reconnected,
+    SignedIn(&'static str),
+    SignedOut(&'static str),
+    Reconnected(&'static str),
     LocalChanged,
 }
 
@@ -95,32 +97,52 @@ pub struct ProviderInfo {
     pub stored: bool,
     /// Whether what is stored is an anonymous session rather than an account.
     pub guest: bool,
+    /// Whether this provider has a live session right now. Several can be live at once.
     pub active: bool,
     pub pending: bool,
     pub error: Option<Failure>,
 }
 
-pub struct Session {
-    state: SessionState,
-    providers: Vec<Arc<dyn MusicProvider>>,
-    active: Option<usize>,
-    awaiting: Option<usize>,
-    resume: Option<(usize, UserProfile)>,
-    error: Option<(usize, Failure)>,
-    settings: Entity<AppSettings>,
-    client: Option<Arc<dyn MusicApi>>,
-    catalog: Option<Arc<CatalogSource>>,
-    playback: Option<Arc<dyn PlaybackFactory>>,
+/// One signed-in streaming account. Local music is not one of these: it already lives beside
+/// every account, the way a second library does.
+struct Live {
+    index: usize,
+    profile: UserProfile,
+    client: Arc<dyn MusicApi>,
+    catalog: Arc<CatalogSource>,
+    playback: Arc<dyn PlaybackFactory>,
     shape: Shape,
     authenticated: bool,
     capabilities: Capabilities,
+    offline: bool,
+    reconnecting: bool,
+    attempt: usize,
+    reconnect: Option<Task<()>>,
+}
+
+pub struct Session {
+    state: SessionState,
+    providers: Vec<Arc<dyn MusicProvider>>,
+    /// Streaming accounts that are signed in right now, in provider order.
+    lives: Vec<Live>,
+    /// Ids each live account has handed out, so a track routes to its own client.
+    owned: Owned,
+    awaiting: Option<usize>,
+    /// The sign-in prompt, even while other accounts stay live and the app stays open.
+    prompt: Option<SignInPrompt>,
+    failures: Vec<(usize, Failure)>,
+    /// Restores still in flight. A second account connecting does not wait on the first.
+    inflight: usize,
+    settings: Entity<AppSettings>,
     io: Io,
     task: Option<Task<()>>,
+    tasks: Vec<Task<()>>,
     prompt_task: Option<Task<()>>,
     input: Option<UnboundedSender<String>>,
     /// The browser window a `SignInPrompt::Secret` opened, while it is up.
     window: Option<webview::Page>,
     window_task: Option<Task<()>>,
+    heartbeat: Option<Task<()>>,
     local_provider: Arc<dyn MusicProvider>,
     local_folders: Vec<PathBuf>,
     local_client: Option<Arc<dyn MusicApi>>,
@@ -130,10 +152,6 @@ pub struct Session {
     local_task: Option<Task<()>>,
     /// Whether a local scan is under way, so the UI can show its progress.
     scanning: bool,
-    watch: Option<Task<()>>,
-    reconnect: Option<Task<()>>,
-    reconnecting: bool,
-    attempt: usize,
 }
 
 impl EventEmitter<SessionEvent> for Session {}
@@ -146,32 +164,26 @@ impl Session {
         io: Io,
         cx: &mut Context<Self>,
     ) -> Self {
-        let remembered = settings.read(cx).provider().to_string();
         let local_folders = settings.read(cx).local_folders().to_vec();
-        let active = providers
-            .iter()
-            .position(|provider| provider.slug() == remembered);
         let local_playback = local_provider.playback_factory();
         let mut session = Self {
             state: SessionState::SignedOut,
             providers,
-            active,
+            lives: Vec::new(),
+            owned: Owned::new(),
             awaiting: None,
-            resume: None,
-            error: None,
+            prompt: None,
+            failures: Vec::new(),
+            inflight: 0,
             settings,
-            client: None,
-            catalog: None,
-            playback: None,
-            shape: Shape::Saved,
-            authenticated: false,
-            capabilities: Capabilities::NONE,
             io,
             task: None,
+            tasks: Vec::new(),
             prompt_task: None,
             input: None,
             window: None,
             window_task: None,
+            heartbeat: None,
             local_provider,
             local_folders,
             local_client: None,
@@ -180,10 +192,6 @@ impl Session {
             local_capabilities: Capabilities::NONE,
             local_task: None,
             scanning: false,
-            watch: None,
-            reconnect: None,
-            reconnecting: false,
-            attempt: 0,
         };
         session.restore_local(cx);
         session
@@ -193,12 +201,44 @@ impl Session {
         &self.state
     }
 
-    pub fn client(&self) -> Option<Arc<dyn MusicApi>> {
-        self.client.clone()
+    /// The sign-in prompt, if one is up. Other accounts stay live while it is, so the app does
+    /// not leave for the login page to collect it.
+    pub fn prompt(&self) -> Option<SignInPrompt> {
+        self.prompt.clone()
     }
 
-    pub fn playback(&self) -> Option<Arc<dyn PlaybackFactory>> {
-        self.playback.clone()
+    pub fn owned(&self) -> Owned {
+        self.owned.clone()
+    }
+
+    /// Records that a streaming id belongs to `slug` before any of that account's calls have
+    /// returned it. A `spotify:` link is the case: the id is known before the account answers.
+    pub fn own(&self, slug: &'static str, id: &str) {
+        self.owned.claim(slug, id);
+    }
+
+    pub fn client_for(&self, id: &str) -> Option<Arc<dyn MusicApi>> {
+        match music::is_local_id(id) {
+            true => self.local_client.clone(),
+            false => self
+                .slug_for(id)
+                .and_then(|slug| self.live(slug))
+                .map(|live| live.client.clone()),
+        }
+    }
+
+    pub fn playback_for(&self, id: &str) -> Option<Arc<dyn PlaybackFactory>> {
+        match music::is_local_id(id) {
+            true => self.local_playback.clone(),
+            false => self
+                .slug_for(id)
+                .and_then(|slug| self.live(slug))
+                .map(|live| live.playback.clone()),
+        }
+    }
+
+    pub fn playback_of(&self, slug: &str) -> Option<Arc<dyn PlaybackFactory>> {
+        self.live(slug).map(|live| live.playback.clone())
     }
 
     pub fn local_client(&self) -> Option<Arc<dyn MusicApi>> {
@@ -208,7 +248,7 @@ impl Session {
     /// The client serving a shelf, if that shelf has a provider right now.
     pub fn client_of(&self, shelf: Shelf) -> Option<Arc<dyn MusicApi>> {
         match shelf {
-            Shelf::Streaming => self.client.clone(),
+            Shelf::Account(slug) => self.live(slug).map(|live| live.client.clone()),
             Shelf::Local => self.local_client.clone(),
         }
     }
@@ -216,7 +256,10 @@ impl Session {
     /// What a shelf's library is made of. The local shelf is always a catalog.
     pub fn shape_of(&self, shelf: Shelf) -> Shape {
         match shelf {
-            Shelf::Streaming => self.shape,
+            Shelf::Account(slug) => self
+                .live(slug)
+                .map(|live| live.shape)
+                .unwrap_or(Shape::Saved),
             Shelf::Local => Shape::Catalog,
         }
     }
@@ -224,7 +267,10 @@ impl Session {
     pub(crate) fn catalog(&self, id: &str) -> Option<Arc<CatalogSource>> {
         match music::is_local_id(id) {
             true => self.local_catalog.clone(),
-            false => self.catalog.clone(),
+            false => self
+                .slug_for(id)
+                .and_then(|slug| self.live(slug))
+                .map(|live| live.catalog.clone()),
         }
     }
 
@@ -259,12 +305,16 @@ impl Session {
                 protected: provider.protected(),
                 stored: provider.stored(),
                 guest: provider.stored_guest(),
-                active: self.active == Some(index),
+                active: self
+                    .lives
+                    .iter()
+                    .any(|live| live.index == index && !live.offline),
                 pending: self.awaiting == Some(index),
-                error: match &self.error {
-                    Some((failed, failure)) if *failed == index => Some(failure.clone()),
-                    _ => None,
-                },
+                error: self
+                    .failures
+                    .iter()
+                    .find(|(failed, _)| *failed == index)
+                    .map(|(_, failure)| failure.clone()),
             })
     }
 
@@ -272,65 +322,88 @@ impl Session {
         self.providers().filter(|info| info.stored)
     }
 
-    /// Whether the current provider's tracks need the Widevine module and it has an account.
-    /// A protected provider the user signed into but is not on right now does not count, so
-    /// nothing about the module is looked for or shown until they switch to it.
+    /// Accounts that have a library to show: signed in, not a guest session.
+    pub fn libraries(&self) -> Vec<(&'static str, &'static str)> {
+        self.lives
+            .iter()
+            .filter(|live| live.authenticated && !live.offline)
+            .map(|live| {
+                let provider = &self.providers[live.index];
+                (provider.slug(), provider.name())
+            })
+            .collect()
+    }
+
+    /// Stored accounts that are not guest sessions, in provider order. A launch can open one
+    /// of their libraries before restore has finished.
+    pub fn stored_libraries(&self) -> Vec<&'static str> {
+        self.providers
+            .iter()
+            .filter(|provider| provider.stored() && !provider.stored_guest())
+            .map(|provider| provider.slug())
+            .collect()
+    }
+
+    /// Whether any live account's tracks need the Widevine module.
     pub fn wants_drm(&self) -> bool {
-        let Some(index) = self.active else {
-            return false;
-        };
-        let provider = &self.providers[index];
-        provider.protected() && provider.stored()
+        self.lives.iter().any(|live| {
+            let provider = &self.providers[live.index];
+            provider.protected() && provider.stored() && live.authenticated
+        })
     }
 
+    /// Signs `slug` out and drops its live session. Other accounts stay.
     pub fn forget(&mut self, slug: &str, cx: &mut Context<Self>) {
-        let Some(index) = self
-            .providers
-            .iter()
-            .position(|provider| provider.slug() == slug)
-        else {
+        let Some(index) = self.index_of(slug) else {
             return;
         };
-        if self.active == Some(index) {
-            return self.sign_out(cx);
-        }
         self.providers[index].sign_out();
-        cx.notify();
+        self.failures.retain(|(failed, _)| *failed != index);
+        self.drop_live(index, cx);
     }
 
+    /// Connects a stored account without disconnecting the others. Already live is a no-op.
     pub fn switch(&mut self, slug: &str, cx: &mut Context<Self>) {
-        if self.is_pending() {
-            return;
-        }
-        let Some(index) = self
-            .providers
-            .iter()
-            .position(|provider| provider.slug() == slug)
-        else {
+        let Some(index) = self.index_of(slug) else {
             return;
         };
-        if self.active == Some(index) && matches!(self.state, SessionState::SignedIn(_)) {
+        if self
+            .lives
+            .iter()
+            .any(|live| live.index == index && !live.offline)
+        {
             return;
         }
-        self.release(cx);
-        self.active = Some(index);
-        self.restore(cx);
+        self.restore_one(index, cx);
     }
 
-    pub fn provider_name(&self) -> Option<&'static str> {
-        let provider = &self.providers[self.active?];
-        Some(provider.name())
+    pub fn name_of(&self, slug: &str) -> Option<&'static str> {
+        self.providers
+            .iter()
+            .find(|provider| provider.slug() == slug)
+            .map(|provider| provider.name())
     }
 
-    pub fn provider_slug(&self) -> Option<&'static str> {
-        let provider = &self.providers[self.active?];
-        Some(provider.slug())
-    }
-
-    /// The host to try when checking whether the network is back. It is the active provider's
-    /// own, so the check never touches a service the app is not already using.
+    /// The host to try when checking whether the network is back. Any live account's own, so
+    /// the check never touches a service the app is not already using.
     pub fn reach(&self) -> Option<String> {
-        self.providers.get(self.active?)?.reach()
+        let index = self
+            .lives
+            .iter()
+            .find(|live| !live.offline)
+            .map(|live| live.index)
+            .or_else(|| self.providers.iter().position(|provider| provider.stored()))?;
+        self.providers.get(index)?.reach()
+    }
+    pub fn account_authenticated(&self, slug: &str) -> bool {
+        self.live(slug)
+            .is_some_and(|live| live.authenticated && !live.offline)
+    }
+
+    /// The history scope for a live account, `{slug}:{profile id}`.
+    pub fn account_scope(&self, slug: &str) -> Option<String> {
+        self.live(slug)
+            .map(|live| format!("{slug}:{}", live.profile.id))
     }
 
     pub fn local_slug(&self) -> &'static str {
@@ -338,10 +411,12 @@ impl Session {
     }
 
     pub fn active_slugs(&self) -> Vec<&'static str> {
-        let mut slugs = Vec::new();
-        if self.client.is_some() {
-            slugs.extend(self.provider_slug());
-        }
+        let mut slugs: Vec<&'static str> = self
+            .lives
+            .iter()
+            .filter(|live| !live.offline)
+            .map(|live| self.providers[live.index].slug())
+            .collect();
         if self.local_client.is_some() {
             slugs.push(self.local_slug());
         }
@@ -349,77 +424,89 @@ impl Session {
     }
 
     pub fn slug_for(&self, id: &str) -> Option<&'static str> {
-        self.provider_for(id).map(|provider| provider.slug())
-    }
-
-    /// The provider an id belongs to, whichever shelf it sits on.
-    pub(crate) fn provider_for(&self, id: &str) -> Option<&dyn MusicProvider> {
         match music::is_local_id(id) {
-            true => Some(self.local_provider.as_ref()),
-            false => self.active.map(|index| self.providers[index].as_ref()),
+            true => Some(self.local_slug()),
+            false => self.owned.slug(id),
         }
     }
 
+    pub fn shelf_for(&self, id: &str) -> Option<Shelf> {
+        match music::is_local_id(id) {
+            true => Some(Shelf::Local),
+            false => self.owned.slug(id).map(Shelf::Account),
+        }
+    }
+
+    /// The provider an id belongs to, whichever library it sits in.
+    pub(crate) fn provider_for(&self, id: &str) -> Option<&dyn MusicProvider> {
+        match music::is_local_id(id) {
+            true => Some(self.local_provider.as_ref()),
+            false => self.slug_for(id).and_then(|slug| {
+                self.providers
+                    .iter()
+                    .find(|provider| provider.slug() == slug)
+                    .map(|provider| provider.as_ref())
+            }),
+        }
+    }
+
+    /// Whether any streaming account is signed in for real, rather than as a guest.
     pub fn authenticated(&self) -> bool {
-        self.authenticated
+        self.lives
+            .iter()
+            .any(|live| live.authenticated && !live.offline)
     }
 
-    /// Whether the active session is an anonymous guest session rather than an authenticated account.
+    /// Whether the only live streaming session is an anonymous guest, so home can fall back
+    /// to the local collection the way it did when guest was the whole session.
     pub fn guest(&self) -> bool {
-        self.client.is_some() && !self.authenticated
+        self.lives.iter().any(|live| !live.offline) && !self.authenticated()
     }
 
-    /// What the live streaming provider can do beyond listing and playing. Nothing is offered
-    /// while signed out, which is what the empty set means.
-    pub fn capabilities(&self) -> Capabilities {
-        self.capabilities
+    /// What the account an id belongs to can do. Local files keep favorites but seed no station.
+    pub fn capabilities_for(&self, id: &str) -> Capabilities {
+        match music::is_local_id(id) {
+            true => self.local_capabilities,
+            false => self
+                .slug_for(id)
+                .and_then(|slug| self.live(slug))
+                .map(|live| live.capabilities)
+                .unwrap_or(Capabilities::NONE),
+        }
     }
 
-    /// The same, for whichever shelf a thing belongs to. Anything that routes by id asks this
-    /// one, since the two shelves can differ: local files keep favorites but seed no station.
+    /// The same, for whichever shelf a thing belongs to.
     pub fn capabilities_of(&self, shelf: Shelf) -> Capabilities {
         match shelf {
-            Shelf::Streaming => self.capabilities,
+            Shelf::Account(slug) => self
+                .live(slug)
+                .map(|live| live.capabilities)
+                .unwrap_or(Capabilities::NONE),
             Shelf::Local => self.local_capabilities,
         }
     }
 
     pub fn is_pending(&self) -> bool {
-        matches!(
-            self.state,
-            SessionState::Restoring | SessionState::Authorizing(_)
-        )
+        self.awaiting.is_some() || self.inflight > 0
     }
 
+    /// Restores every stored account. None of them replaces another.
     pub fn restore(&mut self, cx: &mut Context<Self>) {
-        if self.is_pending() {
+        let stored: Vec<usize> = self
+            .providers
+            .iter()
+            .enumerate()
+            .filter(|(_, provider)| provider.stored())
+            .map(|(index, _)| index)
+            .collect();
+        if stored.is_empty() {
+            self.publish();
+            cx.notify();
             return;
         }
-        let Some(active) = self.active else {
-            self.state = SessionState::SignedOut;
-            cx.notify();
-            cx.emit(SessionEvent::SignedOut);
-            return;
-        };
-        self.state = SessionState::Restoring;
-        cx.notify();
-
-        let provider = self.providers[active].clone();
-        let io = self.io.clone();
-        self.task = Some(cx.spawn(async move |this, cx| {
-            let restored = join(io.spawn(async move { provider.restore().await })).await;
-
-            this.update(cx, |this, cx| match restored {
-                Ok(Some(session)) => this.signed_in(session, active, cx),
-                Ok(None) => {
-                    this.state = SessionState::SignedOut;
-                    cx.notify();
-                    cx.emit(SessionEvent::SignedOut);
-                }
-                Err(error) => this.failed(&error, cx),
-            })
-            .ok();
-        }));
+        for index in stored {
+            self.restore_one(index, cx);
+        }
     }
 
     pub fn sign_in(&mut self, slug: &str, method: SignIn, cx: &mut Context<Self>) {
@@ -437,23 +524,16 @@ impl Session {
         secret_input: SecretInput,
         cx: &mut Context<Self>,
     ) {
-        if self.is_pending() {
+        if self.awaiting.is_some() {
             return;
         }
-        let Some(index) = self
-            .providers
-            .iter()
-            .position(|provider| provider.slug() == slug)
-        else {
+        let Some(index) = self.index_of(slug) else {
             return;
         };
-        self.resume = match &self.state {
-            SessionState::SignedIn(profile) => self.active.map(|active| (active, profile.clone())),
-            _ => None,
-        };
-        self.error = None;
+        self.failures.retain(|(failed, _)| *failed != index);
         self.awaiting = Some(index);
-        self.state = SessionState::Authorizing(None);
+        self.prompt = None;
+        self.publish();
         cx.notify();
 
         let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
@@ -462,9 +542,10 @@ impl Session {
         self.prompt_task = Some(cx.spawn(async move |this, cx| {
             while let Some(prompt) = prompt_rx.recv().await {
                 this.update(cx, |this, cx| {
-                    if matches!(this.state, SessionState::Authorizing(_)) {
+                    if this.awaiting.is_some() {
                         let secret = matches!(prompt, SignInPrompt::Secret);
-                        this.state = SessionState::Authorizing(Some(prompt));
+                        this.prompt = Some(prompt);
+                        this.publish();
                         cx.notify();
                         if secret && matches!(secret_input, SecretInput::Browser) {
                             this.open_window(cx);
@@ -491,7 +572,7 @@ impl Session {
                 this.window = None;
                 match authorized {
                     Ok(session) => this.signed_in(session, index, cx),
-                    Err(error) => this.failed(&error, cx),
+                    Err(error) => this.failed_index(index, &error, true, cx),
                 }
             })
             .ok();
@@ -499,7 +580,7 @@ impl Session {
     }
 
     pub fn cancel_sign_in(&mut self, cx: &mut Context<Self>) {
-        if !matches!(self.state, SessionState::Authorizing(_)) {
+        if self.awaiting.is_none() {
             return;
         }
         if let Some(index) = self.awaiting {
@@ -512,26 +593,15 @@ impl Session {
         self.window = None;
         self.window_task = None;
         self.awaiting = None;
-        self.error = None;
-        if let Some((index, profile)) = self.resume.take() {
-            self.active = Some(index);
-            self.state = SessionState::SignedIn(profile);
-            cx.notify();
-            return;
-        }
-        self.state = SessionState::SignedOut;
+        self.prompt = None;
+        self.publish();
         cx.notify();
-        cx.emit(SessionEvent::SignedOut);
     }
 
     /// Opens the browser window for the secret prompt now showing. The window answers the prompt
     /// itself once the user is through; closing it cancels the sign-in.
     fn open_window(&mut self, cx: &mut Context<Self>) {
-        if !matches!(
-            self.state,
-            SessionState::Authorizing(Some(SignInPrompt::Secret))
-        ) || self.window.is_some()
-        {
+        if !matches!(self.prompt, Some(SignInPrompt::Secret)) || self.window.is_some() {
             return;
         }
         let Some(index) = self.awaiting else {
@@ -554,11 +624,9 @@ impl Session {
             Ok(login) => self.window = Some(login),
             Err(error) => {
                 log::warn!("session: cannot open the sign-in window: {error:#}");
-                // Dropping the provider's task closes its prompt channel, which ends the prompt
-                // task on its own; this runs inside that task, so it must not drop it here.
                 self.task = None;
                 self.input = None;
-                return self.failed(&error, cx);
+                return self.failed_index(index, &error, true, cx);
             }
         }
         self.window_task = Some(cx.spawn(async move |this, cx| {
@@ -593,121 +661,158 @@ impl Session {
         if let Some(input) = &self.input {
             self.window = None;
             input.send(text).ok();
-            if let SessionState::Authorizing(Some(
-                SignInPrompt::Secret | SignInPrompt::Accounts(_),
-            )) = &self.state
-            {
-                self.state = SessionState::Authorizing(None);
+            if matches!(
+                self.prompt,
+                Some(SignInPrompt::Secret | SignInPrompt::Accounts(_))
+            ) {
+                self.prompt = None;
+                self.publish();
                 cx.notify();
             }
         }
     }
 
+    /// Signs every stored streaming account out. Local music is left as it is.
     pub fn sign_out(&mut self, cx: &mut Context<Self>) {
-        if let Some(active) = self.active {
-            self.providers[active].sign_out();
-        }
-        self.release(cx);
-        if let Some(index) = self.remaining() {
-            self.active = Some(index);
-            self.restore(cx);
+        let slugs: Vec<&'static str> = self
+            .providers
+            .iter()
+            .filter(|provider| provider.stored())
+            .map(|provider| provider.slug())
+            .collect();
+        for slug in slugs {
+            self.forget(slug, cx);
         }
     }
 
-    /// Whether the active provider has an account stored, which is what tells a failed restore
-    /// from a user who signed out.
-    fn stored_active(&self) -> bool {
-        self.active
-            .is_some_and(|index| self.providers[index].stored())
-    }
-
-    /// Tries the stored account again once the network is back, for a run that started without
-    /// one. Anything but a run held up by the network is left alone.
+    /// Tries every stored account that is not live again, once the network is back.
     pub fn restore_if_offline(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.state, SessionState::Offline(_)) && self.authenticated() {
+            let missing: Vec<usize> = self
+                .providers
+                .iter()
+                .enumerate()
+                .filter(|(index, provider)| {
+                    provider.stored()
+                        && !self
+                            .lives
+                            .iter()
+                            .any(|live| live.index == *index && !live.offline)
+                })
+                .map(|(index, _)| index)
+                .collect();
+            for index in missing {
+                self.restore_one(index, cx);
+            }
+            return;
+        }
         if matches!(self.state, SessionState::Offline(_)) {
             self.restore(cx);
         }
     }
 
-    fn remaining(&self) -> Option<usize> {
-        self.active
-            .filter(|index| self.providers[*index].stored())
-            .or_else(|| self.providers.iter().position(|provider| provider.stored()))
+    fn index_of(&self, slug: &str) -> Option<usize> {
+        self.providers
+            .iter()
+            .position(|provider| provider.slug() == slug)
     }
 
-    fn release(&mut self, cx: &mut Context<Self>) {
-        self.task = None;
-        self.watch = None;
-        self.reconnect = None;
-        self.reconnecting = false;
-        self.attempt = 0;
-        self.prompt_task = None;
-        self.input = None;
-        self.window = None;
-        self.window_task = None;
-        self.awaiting = None;
-        self.resume = None;
-        self.client = None;
-        self.catalog = None;
-        self.playback = None;
-        self.shape = Shape::Saved;
-        self.authenticated = false;
-        self.capabilities = Capabilities::NONE;
-        self.state = SessionState::SignedOut;
+    fn live(&self, slug: &str) -> Option<&Live> {
+        let index = self.index_of(slug)?;
+        self.lives.iter().find(|live| live.index == index)
+    }
+
+    fn restore_one(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self
+            .lives
+            .iter()
+            .any(|live| live.index == index && !live.offline)
+        {
+            return;
+        }
+        self.inflight += 1;
+        self.publish();
         cx.notify();
-        cx.emit(SessionEvent::SignedOut);
+
+        let provider = self.providers[index].clone();
+        let io = self.io.clone();
+        self.tasks.push(cx.spawn(async move |this, cx| {
+            let restored = join(io.spawn(async move { provider.restore().await })).await;
+            this.update(cx, |this, cx| {
+                this.inflight = this.inflight.saturating_sub(1);
+                match restored {
+                    Ok(Some(session)) => this.signed_in(session, index, cx),
+                    Ok(None) => {
+                        this.publish();
+                        cx.notify();
+                    }
+                    Err(error) => this.failed_index(index, &error, false, cx),
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn drop_live(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(pos) = self.lives.iter().position(|live| live.index == index) else {
+            self.publish();
+            cx.notify();
+            return;
+        };
+        let slug = self.providers[index].slug();
+        self.lives.remove(pos);
+        self.publish();
+        cx.notify();
+        // Subscribers still see the ids this account owned, then they go.
+        cx.emit(SessionEvent::SignedOut(slug));
+        self.owned.forget_slug(slug);
+        if self.lives.is_empty() {
+            self.heartbeat = None;
+        }
     }
 
     fn signed_in(&mut self, session: ProviderSession, index: usize, cx: &mut Context<Self>) {
-        let replaced = self
-            .resume
-            .take()
-            .is_some_and(|(held, profile)| held != index || profile.id != session.profile.id);
-        if replaced {
-            self.drop_previous_session(cx);
-        }
-        self.active = Some(index);
-        self.awaiting = None;
-        self.error = None;
         let slug = self.providers[index].slug();
-        self.settings.update(cx, |settings, cx| {
-            settings.set_provider(slug, cx);
+        let replaced = self.lives.iter().any(|live| live.index == index);
+        if replaced {
+            self.lives.retain(|live| live.index != index);
+            self.owned.forget_slug(slug);
+            cx.emit(SessionEvent::SignedOut(slug));
+        }
+        let client = OwnedApi::wrap(slug, session.api, self.owned.clone());
+        self.lives.push(Live {
+            index,
+            profile: session.profile,
+            catalog: Arc::new(CatalogSource::new(client.clone())),
+            client,
+            playback: session.playback,
+            shape: session.shape,
+            authenticated: session.authenticated,
+            capabilities: session.capabilities,
+            offline: false,
+            reconnecting: false,
+            attempt: 0,
+            reconnect: None,
         });
-        self.catalog = Some(Arc::new(CatalogSource::new(session.api.clone())));
-        self.client = Some(session.api);
-        self.playback = Some(session.playback);
-        self.shape = session.shape;
-        self.authenticated = session.authenticated;
-        self.capabilities = session.capabilities;
-        self.state = SessionState::SignedIn(session.profile);
-        self.attempt = 0;
-        self.start_heartbeat(cx);
+        self.lives.sort_by_key(|live| live.index);
+        self.awaiting = None;
+        self.prompt = None;
+        self.failures.retain(|(failed, _)| *failed != index);
+        self.publish();
+        self.ensure_heartbeat(cx);
         cx.notify();
-        cx.emit(SessionEvent::SignedIn);
+        cx.emit(SessionEvent::SignedIn(slug));
     }
 
-    fn drop_previous_session(&mut self, cx: &mut Context<Self>) {
-        self.client = None;
-        self.catalog = None;
-        self.playback = None;
-        self.shape = Shape::Saved;
-        self.authenticated = false;
-        self.capabilities = Capabilities::NONE;
-        self.watch = None;
-        self.reconnect = None;
-        self.reconnecting = false;
-        self.attempt = 0;
-        cx.emit(SessionEvent::SignedOut);
-    }
-
-    fn start_heartbeat(&mut self, cx: &mut Context<Self>) {
-        self.watch = Some(cx.spawn(async move |this, cx| {
+    fn ensure_heartbeat(&mut self, cx: &mut Context<Self>) {
+        if self.heartbeat.is_some() || self.lives.is_empty() {
+            return;
+        }
+        self.heartbeat = Some(cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor().timer(HEARTBEAT).await;
-                if this
-                    .update(cx, |this, cx| this.reconnect_if_stale(cx))
-                    .is_err()
-                {
+                let keep = this.update(cx, |this, cx| this.reconnect_if_stale(cx));
+                if keep.is_err() || !keep.unwrap_or(false) {
                     return;
                 }
             }
@@ -715,89 +820,137 @@ impl Session {
     }
 
     pub fn reconnect_if_stale(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.reconnecting {
-            return true;
-        }
-        if !matches!(self.state, SessionState::SignedIn(_)) {
+        if self.lives.is_empty() {
             return false;
         }
-        let Some(client) = &self.client else {
-            return false;
-        };
-        if client.alive() {
-            self.attempt = 0;
-            return false;
+        let stale: Vec<usize> = self
+            .lives
+            .iter()
+            .enumerate()
+            .filter(|(_, live)| !live.offline && !live.reconnecting && !live.client.alive())
+            .map(|(pos, _)| pos)
+            .collect();
+        for pos in stale {
+            self.reconnect_at(pos, cx);
         }
-        let Some(active) = self.active else {
-            return false;
-        };
-        let wait = BACKOFF[self.attempt.min(BACKOFF.len() - 1)];
-        self.attempt += 1;
-        self.reconnecting = true;
+        true
+    }
+
+    fn reconnect_at(&mut self, pos: usize, cx: &mut Context<Self>) {
+        let live = &mut self.lives[pos];
+        if live.reconnecting {
+            return;
+        }
+        let index = live.index;
+        let wait = BACKOFF[live.attempt.min(BACKOFF.len() - 1)];
+        live.attempt += 1;
+        live.reconnecting = true;
         log::warn!(
             "session: the {} session went stale, reconnecting in {}s",
-            self.providers[active].name(),
+            self.providers[index].name(),
             wait.as_secs()
         );
-        let provider = self.providers[active].clone();
+        let provider = self.providers[index].clone();
         let io = self.io.clone();
-        self.reconnect = Some(cx.spawn(async move |this, cx| {
+        let task = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(wait).await;
             let restored = join(io.spawn(async move { provider.restore().await })).await;
             this.update(cx, |this, cx| {
-                this.reconnecting = false;
+                if let Some(live) = this.lives.iter_mut().find(|live| live.index == index) {
+                    live.reconnecting = false;
+                }
                 match restored {
-                    Ok(Some(session)) => this.reconnected(session, cx),
+                    Ok(Some(session)) => this.reconnected(session, index, cx),
                     Ok(None) => log::warn!("session: nothing stored to reconnect with"),
                     Err(error) => log::warn!("session: cannot reconnect: {error:#}"),
                 }
             })
             .ok();
-        }));
-        true
+        });
+        if let Some(live) = self.lives.iter_mut().find(|live| live.index == index) {
+            live.reconnect = Some(task);
+        }
     }
 
-    fn reconnected(&mut self, session: ProviderSession, cx: &mut Context<Self>) {
-        self.attempt = 0;
-        self.catalog = Some(Arc::new(CatalogSource::new(session.api.clone())));
-        self.client = Some(session.api);
-        self.playback = Some(session.playback);
-        self.shape = session.shape;
-        self.authenticated = session.authenticated;
-        self.capabilities = session.capabilities;
-        log::debug!("session: reconnected");
+    fn reconnected(&mut self, session: ProviderSession, index: usize, cx: &mut Context<Self>) {
+        let Some(live) = self.lives.iter_mut().find(|live| live.index == index) else {
+            return;
+        };
+        let slug = self.providers[index].slug();
+        let client = OwnedApi::wrap(slug, session.api, self.owned.clone());
+        live.attempt = 0;
+        live.catalog = Arc::new(CatalogSource::new(client.clone()));
+        live.client = client;
+        live.playback = session.playback;
+        live.shape = session.shape;
+        live.authenticated = session.authenticated;
+        live.capabilities = session.capabilities;
+        live.profile = session.profile;
+        live.offline = false;
+        log::debug!("session: reconnected {slug}");
+        self.publish();
         cx.notify();
-        cx.emit(SessionEvent::Reconnected);
+        cx.emit(SessionEvent::Reconnected(slug));
     }
 
-    fn failed(&mut self, error: &Error, cx: &mut Context<Self>) {
+    fn failed_index(
+        &mut self,
+        index: usize,
+        error: &Error,
+        signing_in: bool,
+        cx: &mut Context<Self>,
+    ) {
         let failure = Failure::new(error);
         Network::failed(&format!("{error:#}"), cx);
-        if let Some(failed) = self.awaiting.or(self.active) {
-            self.error = Some((failed, failure.clone()));
+        self.failures.retain(|(failed, _)| *failed != index);
+        self.failures.push((index, failure.clone()));
+        if self.awaiting == Some(index) {
+            self.awaiting = None;
+            self.prompt = None;
+            self.input = None;
+            self.window = None;
         }
-        // Only a restore may end up offline. A sign-in the user is watching says what went
-        // wrong on the page they started it from.
-        let restoring = self.awaiting.is_none();
-        self.awaiting = None;
-        if let Some((index, profile)) = self.resume.take() {
-            self.active = Some(index);
-            self.state = SessionState::SignedIn(profile);
+        let slug = self.providers[index].slug();
+        if !signing_in && failure.offline() && self.providers[index].stored() {
+            log::warn!("session: {slug} could not be reached, carrying on offline");
+            self.publish();
             cx.notify();
             return;
         }
-        if restoring && failure.offline() && self.stored_active() {
-            log::warn!("session: the account could not be reached, carrying on offline");
-            self.state = SessionState::Offline(failure);
-            cx.notify();
+        let was_live = self.lives.iter().any(|live| live.index == index);
+        if was_live {
+            self.drop_live(index, cx);
             return;
         }
-        self.client = None;
-        self.catalog = None;
-        self.playback = None;
-        self.state = SessionState::Failed(failure);
+        self.publish();
         cx.notify();
-        cx.emit(SessionEvent::SignedOut);
+        if !signing_in {
+            cx.emit(SessionEvent::SignedOut(slug));
+        }
+    }
+
+    fn any_connected(&self) -> bool {
+        self.lives.iter().any(|live| !live.offline)
+    }
+
+    fn publish(&mut self) {
+        self.state = if self.awaiting.is_some() && !self.any_connected() {
+            SessionState::Authorizing(self.prompt.clone())
+        } else if let Some(live) = self.lives.iter().find(|live| !live.offline) {
+            SessionState::SignedIn(live.profile.clone())
+        } else if self.inflight > 0 {
+            SessionState::Restoring
+        } else if let Some((_, failure)) = self
+            .failures
+            .iter()
+            .find(|(index, failure)| failure.offline() && self.providers[*index].stored())
+        {
+            SessionState::Offline(failure.clone())
+        } else if let Some((_, failure)) = self.failures.last() {
+            SessionState::Failed(failure.clone())
+        } else {
+            SessionState::SignedOut
+        };
     }
 
     fn restore_local(&mut self, cx: &mut Context<Self>) {

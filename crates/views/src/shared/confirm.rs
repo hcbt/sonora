@@ -2,7 +2,7 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, FocusHandle, Global, Render, Window, div};
 use i18n::t;
 use music::{Album, SavedArtist, Shape, Track};
-use state::{Detail, History, Io, Outcome, Shelf, Sonora, Toasts};
+use state::{Detail, History, Io, Outcome, Sonora, Toasts};
 use ui::{Button, Dismiss, FORM_CONTEXT, Modal, Submit};
 
 #[derive(Clone, Copy)]
@@ -85,7 +85,10 @@ impl Confirm {
     /// `Shape::Catalog` shelf the favorites sit over a library that stays put; on a
     /// `Shape::Saved` one the heart is the library itself, and the question stands.
     pub(crate) fn unstarring(id: &str, cx: &App) -> bool {
-        Sonora::global(cx).library.read(cx).shape(Shelf::of(id)) == Shape::Catalog
+        let Some(shelf) = Sonora::global(cx).session.read(cx).shelf_for(id) else {
+            return false;
+        };
+        Sonora::global(cx).library.read(cx).shape(shelf) == Shape::Catalog
     }
 
     pub fn ask(kind: Kind, apply: impl FnOnce(&mut App) + 'static, cx: &mut App) {

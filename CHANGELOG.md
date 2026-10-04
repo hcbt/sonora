@@ -13,6 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Press F11 or double-click the fullscreen view to make the window fill the whole screen. Turn on
   Use OS fullscreen in settings to have the fullscreen button do the same.
+- Spotify, YouTube Music and the other accounts can stay signed in together. Each one has its
+  own library in the sidebar, next to Local Music, and search, home and playback use whichever
+  account the song belongs to.
 - AIFF files in a local library now show up and play, including `.aif` and `.aifc`. Opening one
   from the file manager works too.
 - A song page lists a track's BPM and key when Spotify or the file knows them, including the

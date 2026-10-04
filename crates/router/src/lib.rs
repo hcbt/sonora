@@ -132,11 +132,33 @@ impl Screen {
             Self::Home => Destination::Home,
             Self::Search => Destination::Search,
             Self::History => Destination::History,
-            Self::Songs => Destination::Library(LibraryTab::Songs),
-            Self::Albums => Destination::Library(LibraryTab::Albums),
-            Self::Playlists => Destination::Library(LibraryTab::Playlists),
-            Self::Artists => Destination::Library(LibraryTab::Artists),
+            Self::Songs => Destination::Library {
+                account: SharedString::default(),
+                tab: LibraryTab::Songs,
+            },
+            Self::Albums => Destination::Library {
+                account: SharedString::default(),
+                tab: LibraryTab::Albums,
+            },
+            Self::Playlists => Destination::Library {
+                account: SharedString::default(),
+                tab: LibraryTab::Playlists,
+            },
+            Self::Artists => Destination::Library {
+                account: SharedString::default(),
+                tab: LibraryTab::Artists,
+            },
             Self::Imported => Destination::Local(LibraryTab::Songs),
+        }
+    }
+
+    pub fn library_tab(self) -> Option<LibraryTab> {
+        match self {
+            Self::Songs => Some(LibraryTab::Songs),
+            Self::Albums => Some(LibraryTab::Albums),
+            Self::Playlists => Some(LibraryTab::Playlists),
+            Self::Artists => Some(LibraryTab::Artists),
+            _ => None,
         }
     }
 }
@@ -202,7 +224,11 @@ impl SettingsTab {
 pub enum Destination {
     Home,
     History,
-    Library(LibraryTab),
+    /// A signed-in account's library. `account` is the provider slug.
+    Library {
+        account: SharedString,
+        tab: LibraryTab,
+    },
     Local(LibraryTab),
     Album(SharedString),
     Song(SharedString),
@@ -230,8 +256,11 @@ impl From<&ui::Pin> for Destination {
 impl Destination {
     pub fn same_section(&self, other: &Destination) -> bool {
         match (self, other) {
-            (Destination::Library(_), Destination::Library(_))
-            | (Destination::Local(_), Destination::Local(_))
+            (
+                Destination::Library { account: left, .. },
+                Destination::Library { account: right, .. },
+            ) if left == right => true,
+            (Destination::Local(_), Destination::Local(_))
             | (Destination::Settings(_), Destination::Settings(_)) => true,
             _ => self == other,
         }

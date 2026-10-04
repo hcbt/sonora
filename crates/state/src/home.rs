@@ -65,17 +65,16 @@ impl Home {
         let picks_seed = fastrand::u64(..);
 
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn => this.reload(cx),
-            SessionEvent::SignedOut => {
-                this.clear();
-                cx.notify();
+            SessionEvent::SignedIn(_) => this.reload(cx),
+            SessionEvent::SignedOut(slug) => {
+                this.drop_account(slug, cx);
             }
             SessionEvent::LocalChanged => {
                 if this.is_local(cx) {
                     this.reload(cx);
                 }
             }
-            SessionEvent::Reconnected => {}
+            SessionEvent::Reconnected(_) => {}
         })
         .detach();
 
@@ -133,26 +132,33 @@ impl Home {
         self.feed(cx);
     }
 
-    fn client(&self, cx: &App) -> Option<Arc<dyn MusicApi>> {
+    fn sources(&self, cx: &App) -> Vec<(&'static str, Arc<dyn MusicApi>)> {
         let session = self.session.read(cx);
         if session.guest() && session.local_client().is_some() {
-            session.local_client()
-        } else {
-            session.client()
+            return session
+                .local_client()
+                .map(|client| vec![(session.local_slug(), client)])
+                .unwrap_or_default();
         }
-    }
-
-    fn shelf(&self, cx: &App) -> Shelf {
-        let session = self.session.read(cx);
-        if session.guest() {
-            Shelf::Local
-        } else {
-            Shelf::Streaming
-        }
+        session
+            .libraries()
+            .into_iter()
+            .filter_map(|(slug, _)| {
+                session
+                    .client_of(Shelf::Account(slug))
+                    .map(|client| (slug, client))
+            })
+            .collect()
     }
 
     pub fn is_local(&self, cx: &App) -> bool {
-        self.shelf(cx) == Shelf::Local
+        self.sources(cx)
+            .iter()
+            .any(|(slug, _)| *slug == self.session.read(cx).local_slug())
+    }
+
+    fn drop_account(&mut self, _slug: &'static str, cx: &mut Context<Self>) {
+        self.reload(cx);
     }
 
     fn clear(&mut self) {
@@ -178,45 +184,85 @@ impl Home {
         if self.feeding || !self.sections.is_empty() {
             return;
         }
-        let Some(client) = self.client(cx) else {
+        let sources = self.sources(cx);
+        if sources.is_empty() {
             return;
-        };
+        }
 
         self.feeding = true;
         self.error = None;
         let io = self.io.clone();
+        let many = sources.len() > 1;
         self.task = Some(cx.spawn(async move |this, cx| {
-            let opened = join(io.spawn(async move { client.home_paged().await })).await;
-            let mut feed = match opened {
-                Ok(feed) => feed,
-                Err(error) => {
-                    log::warn!("home: cannot load the feed: {error:#}");
-                    this.update(cx, |this, cx| {
-                        this.error = Some(crate::blamed(&error, cx));
-                        this.fed(cx);
-                    })
-                    .ok();
-                    return;
-                }
-            };
-
-            // Every lot is the whole feed so far, so each one replaces the last on the page.
-            while let Some(lot) = feed.recv().await {
-                let landed = this.update(cx, |this, cx| {
-                    match lot {
-                        Ok(feed) => this.land(feed, cx),
-                        Err(error) => {
-                            log::warn!("home: cannot load the feed: {error:#}");
+            if !many && let Some(client) = sources.first().map(|(_, client)| client.clone()) {
+                let opened = join(io.spawn(async move { client.home_paged().await })).await;
+                let mut feed = match opened {
+                    Ok(feed) => feed,
+                    Err(error) => {
+                        log::warn!("home: cannot load the feed: {error:#}");
+                        this.update(cx, |this, cx| {
                             this.error = Some(crate::blamed(&error, cx));
-                        }
+                            this.fed(cx);
+                        })
+                        .ok();
+                        return;
                     }
-                    cx.notify();
-                });
-                if landed.is_err() {
-                    return;
+                };
+                while let Some(lot) = feed.recv().await {
+                    let landed = this.update(cx, |this, cx| {
+                        match lot {
+                            Ok(feed) => this.land(feed, cx),
+                            Err(error) => {
+                                log::warn!("home: cannot load the feed: {error:#}");
+                                this.error = Some(crate::blamed(&error, cx));
+                            }
+                        }
+                        cx.notify();
+                    });
+                    if landed.is_err() {
+                        return;
+                    }
+                }
+                this.update(cx, |this, cx| this.fed(cx)).ok();
+                return;
+            }
+
+            let mut merged = HomeFeed::default();
+            let mut trouble = None;
+            for (slug, client) in sources {
+                let name = slug.to_owned();
+                match join(io.spawn(async move { client.home().await })).await {
+                    Ok(mut feed) => {
+                        for section in &mut feed.sections {
+                            section.title = format!("{name} · {}", section.title);
+                        }
+                        merged.listen_again.append(&mut feed.listen_again);
+                        match (merged.quick_picks.take(), feed.quick_picks) {
+                            (Some(mut kept), Some(more)) => {
+                                kept.extend(more);
+                                merged.quick_picks = Some(kept);
+                            }
+                            (kept, more) => merged.quick_picks = kept.or(more),
+                        }
+                        merged.sections.append(&mut feed.sections);
+                    }
+                    Err(error) => {
+                        log::warn!("home: cannot load the {name} feed: {error:#}");
+                        trouble = Some(error);
+                    }
                 }
             }
-            this.update(cx, |this, cx| this.fed(cx)).ok();
+            this.update(cx, |this, cx| {
+                if merged.sections.is_empty() && merged.listen_again.is_empty() {
+                    if let Some(error) = trouble {
+                        this.error = Some(crate::blamed(&error, cx));
+                    }
+                } else {
+                    this.take(merged, cx);
+                }
+                this.fed(cx);
+            })
+            .ok();
         }));
     }
 
@@ -345,7 +391,12 @@ impl Home {
         {
             return;
         }
-        let Some(client) = self.client(cx) else {
+        let Some(client) = self
+            .sources(cx)
+            .into_iter()
+            .next()
+            .map(|(_, client)| client)
+        else {
             return;
         };
 
@@ -377,7 +428,11 @@ impl Home {
     /// feed is in flight and nothing of it has landed yet, or the library the picks would
     /// otherwise be mixed from is.
     pub fn is_loading(&self, cx: &App) -> bool {
-        let shelf = self.shelf(cx);
+        let shelf = self
+            .sources(cx)
+            .first()
+            .map(|(slug, _)| Shelf::Account(slug))
+            .unwrap_or(Shelf::Local);
         self.session.read(cx).is_pending()
             || (self.feeding && self.quick_picks.is_empty())
             || self.library.read(cx).loading(shelf, LibraryPart::Tracks)
@@ -390,7 +445,11 @@ impl Home {
         if self.feeding || !self.picks.is_empty() || self.session.read(cx).is_pending() {
             return;
         }
-        let shelf = self.shelf(cx);
+        let shelf = self
+            .sources(cx)
+            .first()
+            .map(|(slug, _)| Shelf::Account(slug))
+            .unwrap_or(Shelf::Local);
         let ready = matches!(self.library.read(cx).state(shelf), LibraryState::Ready(_));
         if !ready {
             return;

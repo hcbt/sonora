@@ -63,7 +63,7 @@ pub struct Drm {
 impl Drm {
     pub fn new(session: Entity<Session>, io: Io, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&session, |this, session, event, cx| {
-            if matches!(event, SessionEvent::SignedIn)
+            if matches!(event, SessionEvent::SignedIn(_))
                 && drm::supported()
                 && session.read(cx).wants_drm()
             {

@@ -370,10 +370,7 @@ impl Scrobbling {
     fn provider(&self, cx: &App) -> Option<(Arc<dyn MusicApi>, String)> {
         let id = self.current.clone()?;
         let session = self.session.read(cx);
-        let client = match music::is_local_id(&id) {
-            true => session.local_client(),
-            false => session.client(),
-        }?;
+        let client = session.client_for(&id)?;
         Some((client, id))
     }
 }
