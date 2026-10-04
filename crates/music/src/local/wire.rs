@@ -19,7 +19,7 @@ use symphonia::core::probe::Hint;
 use super::id3;
 use crate::{
     Album, ArtistRef, Credit, LOCAL_ALBUM_PREFIX, LOCAL_ARTIST_PREFIX, LOCAL_TRACK_PREFIX,
-    ReleaseType, Track,
+    ReleaseType, Track, TrackRhythm,
 };
 
 const COVER_NAMES: &[&str] = &[
@@ -660,6 +660,7 @@ pub fn track_from_file(
             tags: genres,
             languages: languages.iter().map(|code| language_code(code)).collect(),
             credits,
+            rhythm: file_rhythm(tag).packed(),
         },
         album_artist,
         album_artists,
@@ -921,6 +922,33 @@ fn language_code(code: &str) -> String {
         _ => return code.to_owned(),
     };
     short.to_owned()
+fn file_rhythm(tag: Option<&Tag>) -> TrackRhythm {
+    let Some(tag) = tag else {
+        return TrackRhythm::default();
+    };
+    let bpm = tag
+        .get_string(ItemKey::IntegerBpm)
+        .or_else(|| tag.get_string(ItemKey::Bpm))
+        .and_then(|value| {
+            let number: String = value
+                .trim()
+                .chars()
+                .skip_while(|c| !c.is_ascii_digit())
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            let parsed: f64 = number.parse().ok()?;
+            (parsed.is_finite() && parsed > 0. && parsed <= 999.).then(|| parsed.round() as u32)
+        });
+    let written = tag
+        .get_string(ItemKey::InitialKey)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned);
+    TrackRhythm {
+        bpm,
+        key: None,
+        written,
+    }
 }
 
 #[cfg(test)]

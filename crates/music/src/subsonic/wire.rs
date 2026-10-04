@@ -33,6 +33,7 @@ pub fn track(song: Child, cover: Option<String>) -> Track {
         tags: genres(song.genres.as_deref(), song.genre),
         languages: Vec::new(),
         credits: Vec::new(),
+        rhythm: None,
     }
 }
 

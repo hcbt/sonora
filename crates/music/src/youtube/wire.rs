@@ -47,6 +47,7 @@ pub fn track(source: ytmusic::Track, index: u32) -> Track {
         tags: Vec::new(),
         languages: Vec::new(),
         credits: Vec::new(),
+        rhythm: None,
     }
 }
 

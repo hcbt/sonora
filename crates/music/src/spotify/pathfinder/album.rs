@@ -164,6 +164,7 @@ pub(crate) async fn album(session: &Session, album_id: &str) -> Result<AlbumDeta
         tracks.extend(page.tracks);
 
         let Some(next) = next_offset(offset, page.items, page.total) else {
+            crate::spotify::attributes::apply(session, &mut tracks).await;
             return Ok(AlbumDetail {
                 album: album.context("album Pathfinder response has no album")?,
                 tracks,
@@ -264,6 +265,7 @@ fn track_from(track: PathTrack, album: &Album) -> Result<Track> {
         tags: Vec::new(),
         languages: Vec::new(),
         credits: Vec::new(),
+        rhythm: None,
     })
 }
 

@@ -201,7 +201,12 @@ impl SongView {
             .playcount()
             .map(cells::count)
             .unwrap_or_else(|| t!("common-not-available"));
-        let facts = [
+        let mut facts = vec![
+            (t!("song-album"), SharedString::from(album_name)),
+            (t!("song-released"), release),
+            (t!("song-streams"), streams),
+            (t!("song-position"), number),
+            (t!("song-label"), label),
             (
                 "song-fact-album",
                 t!("song-album"),
@@ -217,6 +222,17 @@ impl SongView {
                 t!("song-popularity-value", value = track.popularity),
             ),
         ];
+        let rhythm = self.detail.read(cx).rhythm();
+        if let Some(bpm) = rhythm.bpm {
+            facts.push((
+                "song-fact-bpm",
+                t!("song-bpm"),
+                SharedString::from(bpm.to_string()),
+            ));
+        }
+        if let Some(key) = cells::key_label(&rhythm) {
+            facts.push(("song-fact-key", t!("song-key"), key));
+        }
         InfoCard::new(t!("song-about"))
             .spoken("song-about-card")
             .stretch()

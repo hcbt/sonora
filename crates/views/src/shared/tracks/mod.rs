@@ -756,6 +756,25 @@ impl TableSource for TrackSource {
                 detail,
             ),
             TrackField::Duration => cells::length(&cell, track.duration, detail),
+            TrackField::Bpm => cells::dim(
+                &cell,
+                track
+                    .rhythm
+                    .as_ref()
+                    .and_then(|rhythm| rhythm.bpm)
+                    .map(|bpm| bpm.to_string())
+                    .unwrap_or_default(),
+                detail,
+            ),
+            TrackField::Key => cells::dim(
+                &cell,
+                track
+                    .rhythm
+                    .as_deref()
+                    .and_then(cells::key_label)
+                    .unwrap_or_default(),
+                detail,
+            ),
             TrackField::Index => cells::blank(&cell),
         }
     }

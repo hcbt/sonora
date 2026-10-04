@@ -247,6 +247,7 @@ pub fn track(value: &Value) -> Option<Track> {
         tags: Vec::new(),
         languages: Vec::new(),
         credits: Vec::new(),
+        rhythm: None,
     })
 }
 
