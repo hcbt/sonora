@@ -1,6 +1,9 @@
-use gpui::{AnyView, Context, Entity, MouseButton, NavigationDirection, Render, Task};
-use gpui::{App, Font, FontFallbacks, SharedString, StyleRefinement, font, prelude::*};
-use gpui::{Window, div};
+use std::collections::HashMap;
+
+use gpui::{
+    AnyView, App, Context, Entity, Font, FontFallbacks, MouseButton, NavigationDirection, Render,
+    SharedString, StyleRefinement, Task, Window, div, font, prelude::*,
+};
 use input::{
     CloseWindow, MinimizeWindow, NavigateBack, NavigateForward, OpenFilter, OpenSearch,
     OpenSettings, Refresh, ShowMembers, ToggleFullscreen, ToggleLyrics, ToggleQueue,
@@ -43,7 +46,7 @@ const SHELL_ZOOM_REST: f32 = 1e-3;
 struct Screens {
     home: Entity<HomeView>,
     history: Entity<HistoryView>,
-    library: Entity<LibraryView>,
+    libraries: HashMap<String, Entity<LibraryView>>,
     local: Entity<LibraryView>,
     artist: Option<Entity<ArtistView>>,
     artist_detail: Option<Entity<ArtistDetail>>,
@@ -177,7 +180,9 @@ impl Root {
         .detach();
 
         cx.subscribe(&session, |_, session, event, cx| {
-            if matches!(event, SessionEvent::SignedIn) && !session.read(cx).authenticated() {
+            if let SessionEvent::SignedIn(slug) = event
+                && !session.read(cx).account_authenticated(slug)
+            {
                 let settings = Sonora::global(cx).settings.clone();
                 let startup = settings.read(cx).startup().to_owned();
                 if Screen::from_id(&startup).is_some_and(Screen::needs_account) {
@@ -185,10 +190,9 @@ impl Root {
                         settings.set_startup(Screen::Home.id(), cx);
                     });
                 }
-                if matches!(
-                    router::trail(cx).read(cx).current(),
-                    Destination::Library(_)
-                ) {
+                if let Destination::Library { account, .. } = router::trail(cx).read(cx).current()
+                    && account.as_ref() == *slug
+                {
                     navigate(Destination::Home, cx);
                 }
             }
@@ -210,17 +214,14 @@ impl Root {
         })
         .detach();
 
-        let library_view = cx.new(|cx| {
+        let local_view = cx.new(|cx| {
             LibraryView::new(
-                Shelf::Streaming,
+                Shelf::Local,
                 library.clone(),
                 playback.clone(),
-                window,
+                crate::shared::cells::content_width(window, gpui::px(0.), cx),
                 cx,
             )
-        });
-        let local_view = cx.new(|cx| {
-            LibraryView::new(Shelf::Local, library.clone(), playback.clone(), window, cx)
         });
 
         let io = Io::global(cx);
@@ -257,14 +258,8 @@ impl Root {
         let user = cx.new(|cx| UserView::new(user_profile.clone(), playback.clone(), cx));
 
         let start = navigation.read(cx).current();
-        let workspace = cx.new(|cx| {
-            Workspace::new(
-                playback.clone(),
-                queue.clone(),
-                library_view.clone().into(),
-                cx,
-            )
-        });
+        let workspace =
+            cx.new(|cx| Workspace::new(playback.clone(), queue.clone(), home.clone().into(), cx));
         let fullscreen = cx.new(|cx| FullscreenView::new(playback.clone(), queue.clone(), cx));
         let ambient = cx.new(Ambient::new);
 
@@ -361,7 +356,7 @@ impl Root {
             screens: Screens {
                 home,
                 history,
-                library: library_view,
+                libraries: HashMap::new(),
                 local: local_view,
                 artist: None,
                 artist_detail: None,
@@ -432,11 +427,44 @@ impl Root {
         (view, detail)
     }
 
+    fn library_view(&mut self, account: &str, cx: &mut Context<Self>) -> Entity<LibraryView> {
+        if let Some(view) = self.screens.libraries.get(account) {
+            return view.clone();
+        }
+        let Some(slug) = self
+            .session
+            .read(cx)
+            .stored_libraries()
+            .into_iter()
+            .find(|slug| *slug == account)
+        else {
+            return self.screens.local.clone();
+        };
+        let library = Sonora::global(cx).library.clone();
+        let playback = self.playback.clone();
+        let view = cx
+            .new(|cx| LibraryView::new(Shelf::Account(slug), library, playback, gpui::px(0.), cx));
+        self.screens
+            .libraries
+            .insert(account.to_owned(), view.clone());
+        view
+    }
+
     fn album(&mut self, cx: &mut Context<Self>) -> (Entity<DetailView>, Entity<Detail>) {
         if let (Some(view), Some(detail)) = (&self.screens.album, &self.screens.album_detail) {
             return (view.clone(), detail.clone());
         }
-        let playcounts = self.session.read(cx).capabilities().playcounts;
+        let playcounts = self
+            .session
+            .read(cx)
+            .libraries()
+            .into_iter()
+            .any(|(slug, _)| {
+                self.session
+                    .read(cx)
+                    .capabilities_of(Shelf::Account(slug))
+                    .playcounts
+            });
         let detail = cx.new(|cx| {
             Detail::new(
                 self.session.clone(),
@@ -656,7 +684,19 @@ impl Root {
                 let history = Sonora::global(cx).history.clone();
                 Box::new(move |cx| matches!(history.read(cx).state(), HistoryState::Loading))
             }
-            Destination::Library(_) => shelf(Shelf::Streaming),
+            Destination::Library { account, .. } => {
+                let session = Sonora::global(cx).session.clone();
+                let slug = session
+                    .read(cx)
+                    .libraries()
+                    .into_iter()
+                    .find(|(slug, _)| *slug == account.as_ref())
+                    .map(|(slug, _)| slug);
+                match slug {
+                    Some(slug) => shelf(Shelf::Account(slug)),
+                    None => Box::new(|_| false),
+                }
+            }
             Destination::Local(_) => {
                 let session = Sonora::global(cx).session.clone();
                 let local = shelf(Shelf::Local);
@@ -702,8 +742,17 @@ impl Root {
                 let history = Sonora::global(cx).history.clone();
                 history.update(cx, |history, cx| history.reload(cx));
             }
-            Destination::Library(_) => {
-                library.update(cx, |library, cx| library.reload(Shelf::Streaming, cx))
+            Destination::Library { account, .. } => {
+                let session = Sonora::global(cx).session.clone();
+                let slug = session
+                    .read(cx)
+                    .libraries()
+                    .into_iter()
+                    .find(|(slug, _)| *slug == account.as_ref())
+                    .map(|(slug, _)| slug);
+                if let Some(slug) = slug {
+                    library.update(cx, |library, cx| library.reload(Shelf::Account(slug), cx));
+                }
             }
             Destination::Local(_) => {
                 library.update(cx, |library, cx| library.reload(Shelf::Local, cx))
@@ -712,13 +761,15 @@ impl Root {
                 if let Some(detail) = self.screens.album_detail.clone() {
                     detail.update(cx, |detail, cx| detail.refresh(cx));
                 }
-                library.update(cx, |library, cx| library.refresh(Shelf::of(&id), cx));
+                let shelf = Sonora::global(cx).session.read(cx).shelf_of(&id);
+                library.update(cx, |library, cx| library.refresh(shelf, cx));
             }
             Destination::Playlist(id) => {
                 if let Some(detail) = self.screens.playlist_detail.clone() {
                     detail.update(cx, |detail, cx| detail.refresh(cx));
                 }
-                library.update(cx, |library, cx| library.refresh(Shelf::of(&id), cx));
+                let shelf = Sonora::global(cx).session.read(cx).shelf_of(&id);
+                library.update(cx, |library, cx| library.refresh(shelf, cx));
             }
             Destination::Artist(_) => {
                 if let Some(detail) = self.screens.artist_detail.clone() {
@@ -961,13 +1012,11 @@ impl Root {
                 toolbar = Some(local.read(cx).toolbar());
                 local.into()
             }
-            Destination::Library(tab) => {
-                self.screens
-                    .library
-                    .update(cx, |library, cx| library.select(tab.into(), cx));
-                let library = self.screens.library.clone();
-                toolbar = Some(library.read(cx).toolbar());
-                library.into()
+            Destination::Library { account, tab } => {
+                let view = self.library_view(&account, cx);
+                view.update(cx, |library, cx| library.select(tab.into(), cx));
+                toolbar = Some(view.read(cx).toolbar());
+                view.into()
             }
             Destination::Album(id) => {
                 let (album, detail) = self.album(cx);

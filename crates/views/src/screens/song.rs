@@ -202,11 +202,6 @@ impl SongView {
             .map(cells::count)
             .unwrap_or_else(|| t!("common-not-available"));
         let mut facts = vec![
-            (t!("song-album"), SharedString::from(album_name)),
-            (t!("song-released"), release),
-            (t!("song-streams"), streams),
-            (t!("song-position"), number),
-            (t!("song-label"), label),
             (
                 "song-fact-album",
                 t!("song-album"),

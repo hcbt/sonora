@@ -31,46 +31,38 @@ const PIN_POLL: Duration = Duration::from_secs(60);
 /// and unchecked reads would spend the provider's request budget before the liked songs load.
 static READS: Semaphore = Semaphore::const_new(4);
 
-/// Which provider a library page, an id or a playlist belongs to. The streaming shelf follows
-/// the signed-in provider; the local shelf follows the imported folder.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Which library a page, an id or a playlist belongs to. Each signed-in account is its own
+/// shelf; the local shelf follows the imported folders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Shelf {
-    Streaming,
+    Account(&'static str),
     Local,
 }
 
 impl Shelf {
-    /// The shelf an id belongs to, by its prefix.
-    pub fn of(id: &str) -> Self {
-        match music::is_local_id(id) {
-            true => Self::Local,
-            false => Self::Streaming,
-        }
+    pub fn local(self) -> bool {
+        matches!(self, Self::Local)
     }
 
-    pub fn local(self) -> bool {
-        self == Self::Local
+    pub fn slug(self) -> Option<&'static str> {
+        match self {
+            Self::Account(slug) => Some(slug),
+            Self::Local => None,
+        }
     }
 
     /// What a log line calls the shelf.
     fn name(self) -> &'static str {
         match self {
-            Self::Streaming => "streaming",
+            Self::Account(slug) => slug,
             Self::Local => "local",
-        }
-    }
-
-    fn slot(self) -> usize {
-        match self {
-            Self::Streaming => 0,
-            Self::Local => 1,
         }
     }
 
     /// The parts whose joint failure marks the whole shelf failed, rather than one problem.
     fn fatal(self) -> &'static [LibraryPart] {
         match self {
-            Self::Streaming => &FATAL,
+            Self::Account(_) => &FATAL,
             Self::Local => &FATAL_LOCAL,
         }
     }
@@ -607,7 +599,7 @@ impl Library {
         if S::requests(self).contains_key(&id) {
             return;
         }
-        let Some(client) = self.session.read(cx).client_of(Shelf::of(&id)) else {
+        let Some(client) = self.session.read(cx).client_of(self.shelf_of(&id)) else {
             return;
         };
 
@@ -712,13 +704,16 @@ impl Library {
     /// Counts one answer toward sweep `id`, keeping what it removed, and reports the sweep once
     /// every answer is in.
     fn answer(&mut self, id: usize, gone: Option<Gone>, cx: &mut Context<Self>) {
+        let removed = gone.map(|gone| {
+            let shelf = gone.id().map_or(Shelf::Account(""), |id| self.shelf_of(id));
+            let epoch = self.epochs.get(&shelf).copied().unwrap_or(0);
+            Removed { gone, epoch }
+        });
         let Some(sweep) = self.sweeps.get_mut(&id) else {
             return;
         };
-        if let Some(gone) = gone {
-            let shelf = gone.id().map_or(Shelf::Streaming, Shelf::of);
-            let epoch = self.epochs[shelf.slot()];
-            sweep.gone.push(Removed { gone, epoch });
+        if let Some(removed) = removed {
+            sweep.gone.push(removed);
         }
         sweep.left = sweep.left.saturating_sub(1);
         if sweep.left > 0 {
@@ -775,7 +770,7 @@ impl Library {
             let Some(id) = gone.id().map(str::to_owned) else {
                 continue;
             };
-            if self.epochs[Shelf::of(&id).slot()] != epoch {
+            if self.epochs.get(&self.shelf_of(&id)).copied().unwrap_or(0) != epoch {
                 continue;
             }
             match gone {
@@ -870,8 +865,8 @@ impl Savable for Track {
         let Some(id) = track.id.clone() else {
             return;
         };
-        let shelf = Shelf::of(&id);
-        if !library.session.read(cx).shape_of(shelf).editable() {
+        let shelf = library.shelf_of(&id);
+        if !library.session.read(cx).capabilities_of(shelf).library {
             return;
         }
         let Some(ready) = library.held_mut(shelf).ready_mut() else {
@@ -1118,7 +1113,9 @@ impl LibraryState {
 impl gpui::EventEmitter<LibraryEvent> for Library {}
 
 pub struct Library {
-    shelves: [Held; 2],
+    shelves: HashMap<Shelf, Held>,
+    /// Returned for a shelf that has not been opened, so a lookup never invents a row.
+    missing: Held,
     session: Entity<Session>,
     io: Io,
     playlist_task: Option<Task<()>>,
@@ -1127,7 +1124,8 @@ pub struct Library {
     relisting: Option<Task<()>>,
     pin_targets_task: Option<Task<()>>,
     pin_task: Option<Task<()>>,
-    pin_targets: Option<Vec<music::PinTarget>>,
+    pin_targets: HashMap<&'static str, Vec<music::PinTarget>>,
+    owned: crate::owned::Owned,
     pending: HashMap<String, Task<()>>,
     pending_albums: HashMap<String, Task<()>>,
     pending_artists: HashMap<String, Task<()>>,
@@ -1138,12 +1136,12 @@ pub struct Library {
     reading: HashMap<String, Task<()>>,
     mosaics: HashMap<String, Task<()>>,
     snapshots: Snapshots,
-    priming: [Option<Task<()>>; 2],
+    priming: HashMap<Shelf, Task<()>>,
     /// Whether each shelf is done reading the last run's snapshot, found or not.
-    primed: [bool; 2],
+    primed: HashSet<Shelf>,
     /// Counts the accounts and folder sets each shelf has had, so an Undo made under one never
     /// acts on the next.
-    epochs: [u64; 2],
+    epochs: HashMap<Shelf, u64>,
     sweeps: HashMap<usize, Sweep>,
     /// The sweep each family is gathering this turn's removals into.
     gathering: HashMap<Family, usize>,
@@ -1152,7 +1150,6 @@ pub struct Library {
     /// The row removals whose toast is up, by playlist id.
     raised_rows: HashMap<String, RowsRaised>,
 }
-
 impl Library {
     pub fn new(
         session: Entity<Session>,
@@ -1161,13 +1158,14 @@ impl Library {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, session, event, cx| match event {
-            SessionEvent::SignedIn => {
-                this.epochs[Shelf::Streaming.slot()] += 1;
+            SessionEvent::SignedIn(slug) => {
+                let shelf = Shelf::Account(slug);
+                *this.epochs.entry(shelf).or_default() += 1;
                 this.pin_task = None;
-                if !session.read(cx).authenticated() {
+                if !session.read(cx).account_authenticated(slug) {
                     this.pin_targets_task = None;
-                    this.pin_targets = None;
-                    this.held_mut(Shelf::Streaming).clear();
+                    this.pin_targets.remove(slug);
+                    this.held_mut(shelf).clear();
                     cx.notify();
                     return;
                 }
@@ -1184,21 +1182,23 @@ impl Library {
                 };
                 this.sweeps.retain(|_, sweep| !favorite(&sweep.family));
                 this.gathering.retain(|family, _| !favorite(family));
-                this.pin_targets = None;
-                this.sync_pin_targets(cx);
-                this.prime(Shelf::Streaming, cx);
-                this.load(Shelf::Streaming, cx);
+                this.sync_pin_targets(slug, cx);
+                this.prime(shelf, cx);
+                this.load(shelf, cx);
             }
-            SessionEvent::SignedOut => {
-                this.epochs[Shelf::Streaming.slot()] += 1;
+            SessionEvent::SignedOut(slug) => {
+                let shelf = Shelf::Account(slug);
+                *this.epochs.entry(shelf).or_default() += 1;
                 this.sweeps.clear();
                 this.gathering.clear();
                 this.raised.clear();
                 this.raised_rows.clear();
-                this.forget(Shelf::Streaming, cx);
+                this.forget(shelf, cx);
+                this.shelves.remove(&shelf);
+                this.priming.remove(&shelf);
                 this.pin_task = None;
                 this.pin_targets_task = None;
-                this.pin_targets = None;
+                this.pin_targets.remove(slug);
                 this.contents.clear();
                 this.reading.clear();
                 this.mosaics.clear();
@@ -1208,19 +1208,24 @@ impl Library {
                 this.pending_albums.clear();
                 this.pending_artists.clear();
                 this.pending_library.clear();
-                this.held_mut(Shelf::Streaming).clear();
+                this.held_mut(shelf).clear();
                 cx.notify();
             }
             // What was loaded stays up, read through the downloads filter.
             SessionEvent::WentOffline => {}
-            SessionEvent::Reconnected => this.refresh(Shelf::Streaming, cx),
+            SessionEvent::Reconnected(slug) => {
+                let shelf = Shelf::Account(slug);
+                if matches!(this.held(shelf).state, LibraryState::Failed(_)) {
+                    this.load(shelf, cx);
+                }
+            }
             SessionEvent::LocalChanged => {
-                this.epochs[Shelf::Local.slot()] += 1;
+                *this.epochs.entry(Shelf::Local).or_default() += 1;
                 this.hidden_local_tracks.clear();
                 match session.read(cx).client_of(Shelf::Local) {
                     Some(_) => this.load(Shelf::Local, cx),
                     None => {
-                        this.held_mut(Shelf::Local).clear();
+                        this.shelves.remove(&Shelf::Local);
                         cx.notify();
                     }
                 }
@@ -1231,21 +1236,31 @@ impl Library {
         // starts from what the last run kept the moment the session settles there.
         cx.observe(&session, |this, session, cx| {
             let offline = matches!(session.read(cx).state(), SessionState::Offline(_));
-            if offline && matches!(this.held(Shelf::Streaming).state, LibraryState::Empty) {
-                this.prime(Shelf::Streaming, cx);
+            if !offline {
+                return;
+            }
+            for slug in session.read(cx).stored_libraries() {
+                let shelf = Shelf::Account(slug);
+                if matches!(this.held(shelf).state, LibraryState::Empty) {
+                    this.prime(shelf, cx);
+                }
             }
         })
         .detach();
 
+        let stored = session.read(cx).stored_libraries();
+        let owned = session.read(cx).owned();
         let mut library = Self {
-            shelves: [Held::empty(), Held::empty()],
+            shelves: HashMap::new(),
+            missing: Held::empty(),
             session,
             io,
             playlist_task: None,
             relisting: None,
             pin_targets_task: None,
             pin_task: None,
-            pin_targets: None,
+            owned,
+            pin_targets: HashMap::new(),
             pending: HashMap::new(),
             pending_albums: HashMap::new(),
             pending_artists: HashMap::new(),
@@ -1255,18 +1270,20 @@ impl Library {
             reading: HashMap::new(),
             mosaics: HashMap::new(),
             snapshots: Snapshots::new(cache),
-            priming: [None, None],
-            primed: [true, true],
-            epochs: [0, 0],
+            priming: HashMap::new(),
+            primed: HashSet::new(),
+            epochs: HashMap::new(),
             sweeps: HashMap::new(),
             gathering: HashMap::new(),
             next_sweep: 0,
             raised: HashMap::new(),
             raised_rows: HashMap::new(),
         };
-        library.held_mut(Shelf::Streaming).state = LibraryState::Loading;
         library.held_mut(Shelf::Local).shape = Shape::Catalog(Catalog::Fixed);
-        library.prime(Shelf::Streaming, cx);
+        for slug in stored {
+            library.held_mut(Shelf::Account(slug)).state = LibraryState::Loading;
+            library.prime(Shelf::Account(slug), cx);
+        }
         match library.session.read(cx).client_of(Shelf::Local).is_some() {
             true => library.load(Shelf::Local, cx),
             false => library.prime(Shelf::Local, cx),
@@ -1280,10 +1297,12 @@ impl Library {
     /// of that part.
     /// A shelf that has already heard from its provider is left alone.
     fn prime(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
-        let session = self.session.read(cx);
         let provider = match shelf {
-            Shelf::Streaming => session.provider_slug(),
-            Shelf::Local => (!session.local_paths().is_empty()).then(|| session.local_slug()),
+            Shelf::Account(slug) => Some(slug),
+            Shelf::Local => {
+                let session = self.session.read(cx);
+                (!session.local_paths().is_empty()).then(|| session.local_slug())
+            }
         };
         let Some(provider) = provider else {
             return;
@@ -1291,64 +1310,67 @@ impl Library {
 
         let snapshots = self.snapshots.clone();
         let io = self.io.clone();
-        self.primed[shelf.slot()] = false;
-        self.priming[shelf.slot()] = Some(cx.spawn(async move |this, cx| {
-            let remembered = io
-                .spawn_blocking(move || snapshots.restore(provider))
-                .await
-                .ok()
-                .flatten();
-            this.update(cx, |this, cx| {
-                this.primed[shelf.slot()] = true;
-                cx.notify();
-                let Some(remembered) = remembered else {
-                    return;
-                };
-                let held = this.held_mut(shelf);
-                if !matches!(held.state, LibraryState::Empty | LibraryState::Loading) {
-                    return;
-                }
-                let Remembered {
-                    shape,
-                    totals,
-                    parts,
-                    tracks,
-                    playlists,
-                    albums,
-                    artists,
-                    starred_tracks,
-                    starred_albums,
-                    starred_artists,
-                } = remembered;
-                log::debug!(
-                    "library: the {} shelf starts from a snapshot of {} songs, {} playlists, \
+        self.primed.remove(&shelf);
+        self.priming.insert(
+            shelf,
+            cx.spawn(async move |this, cx| {
+                let remembered = io
+                    .spawn_blocking(move || snapshots.restore(provider))
+                    .await
+                    .ok()
+                    .flatten();
+                this.update(cx, |this, cx| {
+                    this.primed.insert(shelf);
+                    cx.notify();
+                    let Some(remembered) = remembered else {
+                        return;
+                    };
+                    let held = this.held_mut(shelf);
+                    if !matches!(held.state, LibraryState::Empty | LibraryState::Loading) {
+                        return;
+                    }
+                    let Remembered {
+                        shape,
+                        totals,
+                        parts,
+                        tracks,
+                        playlists,
+                        albums,
+                        artists,
+                        starred_tracks,
+                        starred_albums,
+                        starred_artists,
+                    } = remembered;
+                    log::debug!(
+                        "library: the {} shelf starts from a snapshot of {} songs, {} playlists, \
                      {} albums and {} artists",
-                    shelf.name(),
-                    tracks.len(),
-                    playlists.len(),
-                    albums.len(),
-                    artists.len()
-                );
-                held.shape = shape;
-                held.expected = totals;
-                held.stale = parts.into_iter().collect();
-                held.awaited = LibraryPart::ALL.to_vec();
-                held.starred = Starred {
-                    tracks: starred_tracks.into(),
-                    albums: starred_albums.into(),
-                    artists: starred_artists.into(),
-                };
-                held.state = LibraryState::Ready(Ready {
-                    tracks: tracks.into(),
-                    playlists: playlists.into(),
-                    albums: albums.into(),
-                    artists: artists.into(),
-                    problems: Vec::new(),
-                });
-                cx.notify();
-            })
-            .ok();
-        }));
+                        shelf.name(),
+                        tracks.len(),
+                        playlists.len(),
+                        albums.len(),
+                        artists.len()
+                    );
+                    held.shape = shape;
+                    held.expected = totals;
+                    held.stale = parts.into_iter().collect();
+                    held.awaited = LibraryPart::ALL.to_vec();
+                    held.starred = Starred {
+                        tracks: starred_tracks.into(),
+                        albums: starred_albums.into(),
+                        artists: starred_artists.into(),
+                    };
+                    held.state = LibraryState::Ready(Ready {
+                        tracks: tracks.into(),
+                        playlists: playlists.into(),
+                        albums: albums.into(),
+                        artists: artists.into(),
+                        problems: Vec::new(),
+                    });
+                    cx.notify();
+                })
+                .ok();
+            }),
+        );
     }
 
     /// Remembers a list that has just arrived in full, for the next launch to show. A part that
@@ -1386,23 +1408,22 @@ impl Library {
         let Some(provider) = self.provider_of(shelf, cx) else {
             return;
         };
-        self.priming[shelf.slot()] = None;
-        self.primed[shelf.slot()] = true;
+        self.priming.remove(&shelf);
+        self.primed.insert(shelf);
         let snapshots = self.snapshots.clone();
         drop(self.io.spawn_blocking(move || snapshots.forget(provider)));
     }
 
     /// The provider whose name a shelf's snapshots are filed under.
     fn provider_of(&self, shelf: Shelf, cx: &App) -> Option<&'static str> {
-        let session = self.session.read(cx);
         match shelf {
-            Shelf::Streaming => session.provider_slug(),
-            Shelf::Local => Some(session.local_slug()),
+            Shelf::Account(slug) => Some(slug),
+            Shelf::Local => Some(self.session.read(cx).local_slug()),
         }
     }
 
-    pub fn pin_targets(&self) -> Option<&[music::PinTarget]> {
-        self.pin_targets.as_deref()
+    pub fn pin_targets(&self) -> Vec<music::PinTarget> {
+        self.pin_targets.values().flatten().cloned().collect()
     }
 
     pub fn pin_pending(&self) -> bool {
@@ -1415,6 +1436,7 @@ impl Library {
     /// too, since Sonora keeps the pin itself and the sidebar has no limit of its own.
     pub fn set_pinned(
         &mut self,
+        slug: &'static str,
         uri: String,
         pinned: bool,
         done: impl FnOnce(bool, &mut App) + 'static,
@@ -1422,12 +1444,12 @@ impl Library {
     ) {
         if self
             .pin_targets
-            .as_ref()
+            .get(slug)
             .is_some_and(|items| holds_pin(items, &uri) == pinned)
         {
             return;
         }
-        let Some(client) = self.session.read(cx).client_of(Shelf::Streaming) else {
+        let Some(client) = self.session.read(cx).client_of(Shelf::Account(slug)) else {
             return;
         };
         // Keep an older refresh from overwriting the result of this mutation.
@@ -1452,10 +1474,11 @@ impl Library {
             this.update(cx, |this, cx| {
                 this.pin_task = None;
                 match result {
-                    Ok((music::PinOutcome::Updated, items)) => {
-                        this.pin_targets = items;
+                    Ok((music::PinOutcome::Updated, Some(items))) => {
+                        this.pin_targets.insert(slug, items);
                         done(true, cx);
                     }
+                    Ok((music::PinOutcome::Updated, None)) => done(true, cx),
                     Ok((music::PinOutcome::LimitReached, _)) => {
                         log::debug!(
                             "library: the provider's pin limit is reached, pinning locally"
@@ -1473,7 +1496,7 @@ impl Library {
                     }
                 }
                 // the change stopped the pin reads, which pick up again from here
-                this.sync_pin_targets(cx);
+                this.sync_pin_targets(slug, cx);
                 cx.notify();
             })
             .ok();
@@ -1483,15 +1506,23 @@ impl Library {
 
     /// Reads the provider's pins. A provider that does not say when they change elsewhere is
     /// asked again every `PIN_POLL` for as long as the task lives.
-    fn sync_pin_targets(&mut self, cx: &mut Context<Self>) {
+    fn sync_pin_targets(&mut self, slug: &'static str, cx: &mut Context<Self>) {
         if self.pin_pending() {
             return;
         }
-        self.pin_targets_task = None;
-        let Some(client) = self.session.read(cx).client_of(Shelf::Streaming) else {
+        let Some(client) = self.session.read(cx).client_of(Shelf::Account(slug)) else {
             return;
         };
         let live = client.connect().is_some();
+        if !self
+            .session
+            .read(cx)
+            .capabilities_of(Shelf::Account(slug))
+            .pins
+        {
+            return;
+        }
+        self.pin_targets_task = None;
         let io = self.io.clone();
         self.pin_targets_task = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -1499,8 +1530,8 @@ impl Library {
                 let loaded = join(io.spawn(async move { client.pin_targets().await })).await;
                 if this
                     .update(cx, |this, cx| match loaded {
-                        Ok(items) if items != this.pin_targets => {
-                            this.pin_targets = items;
+                        Ok(Some(items)) if this.pin_targets.get(slug) != Some(&items) => {
+                            this.pin_targets.insert(slug, items);
                             cx.notify();
                         }
                         Ok(_) => {}
@@ -1520,11 +1551,22 @@ impl Library {
     }
 
     fn held(&self, shelf: Shelf) -> &Held {
-        &self.shelves[shelf.slot()]
+        self.shelves.get(&shelf).unwrap_or(&self.missing)
     }
 
     fn held_mut(&mut self, shelf: Shelf) -> &mut Held {
-        &mut self.shelves[shelf.slot()]
+        self.shelves.entry(shelf).or_insert_with(Held::empty)
+    }
+
+    fn shelf_of(&self, id: &str) -> Shelf {
+        match music::is_local_id(id) {
+            true => Shelf::Local,
+            false => self
+                .owned
+                .slug(id)
+                .map(Shelf::Account)
+                .unwrap_or(Shelf::Account("")),
+        }
     }
 
     pub fn state(&self, shelf: Shelf) -> &LibraryState {
@@ -1626,7 +1668,7 @@ impl Library {
     /// to its downloads the provider sends nothing, so only the last run's snapshot is waited on.
     pub fn waiting(&self, shelf: Shelf, part: LibraryPart, cx: &App) -> bool {
         match Network::downloads_only(shelf, cx) {
-            true => !self.primed[shelf.slot()],
+            true => !self.primed.contains(&shelf),
             false => self.loading(shelf, part),
         }
     }
@@ -1657,7 +1699,7 @@ impl Library {
     }
 
     fn favorites(&self, id: &str) -> Option<Favorites<'_>> {
-        self.held(Shelf::of(id)).favorites()
+        self.held(self.shelf_of(id)).favorites()
     }
 
     pub fn pending(&self, track_id: &str) -> bool {
@@ -1687,7 +1729,7 @@ impl Library {
     /// a `Catalog::Editable` provider draws the distinction, and there the pages list the
     /// library, so this is what they list.
     pub fn in_library(&self, id: &str) -> bool {
-        let state = &self.held(Shelf::of(id)).state;
+        let state = &self.held(self.shelf_of(id)).state;
         state
             .tracks()
             .iter()
@@ -1764,7 +1806,7 @@ impl Library {
         if self.pending_library.contains_key(&id) {
             return;
         }
-        let shelf = Shelf::of(&id);
+        let shelf = self.shelf_of(&id);
         let Some(client) = self.session.read(cx).client_of(shelf) else {
             return;
         };
@@ -1826,7 +1868,7 @@ impl Library {
     }
 
     fn set_album_saved(&mut self, album: Album, saved: bool) {
-        let Some(favorites) = self.held_mut(Shelf::of(&album.id)).favorites_mut() else {
+        let Some(favorites) = self.held_mut(self.shelf_of(&album.id)).favorites_mut() else {
             return;
         };
         let albums = favorites.albums;
@@ -1852,7 +1894,7 @@ impl Library {
 
     /// A listed artist, from the shelf's pages or its favorites.
     pub fn artist(&self, id: &str) -> Option<&SavedArtist> {
-        let held = self.held(Shelf::of(id));
+        let held = self.held(self.shelf_of(id));
         held.state
             .artists()
             .iter()
@@ -1872,7 +1914,7 @@ impl Library {
     }
 
     fn set_artist_saved(&mut self, artist: SavedArtist, saved: bool) {
-        let Some(favorites) = self.held_mut(Shelf::of(&artist.id)).favorites_mut() else {
+        let Some(favorites) = self.held_mut(self.shelf_of(&artist.id)).favorites_mut() else {
             return;
         };
         let artists = favorites.artists;
@@ -1971,7 +2013,7 @@ impl Library {
                 name: None,
                 target: None,
                 invalidated: Vec::new(),
-                shelf: Shelf::of(&id),
+                shelf: self.shelf_of(&id),
             },
             move |client| async move { client.export_playlist(&id, &path).await },
             |_, (), _| {},
@@ -1987,7 +2029,7 @@ impl Library {
                 done: Some("toast-playlist-renamed"),
                 name: None,
                 target: None,
-                shelf: Shelf::of(&id),
+                shelf: self.shelf_of(&id),
                 invalidated: vec![id.clone()],
             },
             move |client| async move { client.rename_playlist(&id, &name).await },
@@ -2007,7 +2049,7 @@ impl Library {
                 done: Some("toast-playlist-visibility"),
                 name: None,
                 target: None,
-                shelf: Shelf::of(&id),
+                shelf: self.shelf_of(&id),
                 invalidated: vec![id.clone()],
             },
             move |client| async move { client.set_playlist_public(&id, public).await },
@@ -2043,6 +2085,7 @@ impl Library {
             .and_then(|playlist| playlist.cover.clone());
         let changed = id.clone();
         let renamed = name.clone();
+        let shelf = self.shelf_of(&id);
         let done = match (name.is_some(), picture.is_some()) {
             (true, _) => "toast-playlist-updated",
             (false, true) => "toast-playlist-cover-changed",
@@ -2054,7 +2097,7 @@ impl Library {
                 done: Some(done),
                 name: None,
                 target: None,
-                shelf: Shelf::of(&id),
+                shelf,
                 invalidated: vec![id.clone()],
             },
             move |client| async move {
@@ -2095,8 +2138,10 @@ impl Library {
                     },
                     cx,
                 );
-                if bare {
-                    this.build_mosaics(cx);
+                if bare
+                    && let Shelf::Account(slug) = shelf
+                {
+                    this.build_mosaics(slug, cx);
                 }
                 cx.emit(LibraryEvent::PlaylistChanged(changed));
             },
@@ -2140,7 +2185,7 @@ impl Library {
                 done: Some("toast-track-added"),
                 name,
                 target,
-                shelf: Shelf::of(&playlist_id),
+                shelf: self.shelf_of(&playlist_id),
                 invalidated: vec![playlist_id.clone()],
             },
             move |client| async move {
@@ -2185,7 +2230,7 @@ impl Library {
                 done: None,
                 name: None,
                 target: None,
-                shelf: Shelf::of(&playlist_id),
+                shelf: self.shelf_of(&playlist_id),
                 invalidated,
             },
             move |client| async move {
@@ -2224,7 +2269,7 @@ impl Library {
     /// favorite the shelf lists and no request is changing can leave.
     fn favorite(&self, track_id: &str) -> Option<Track> {
         let track = self
-            .state(Shelf::Streaming)
+            .state(self.shelf_of(track_id))
             .tracks()
             .iter()
             .find(|track| track.id.as_deref() == Some(track_id))
@@ -2259,7 +2304,11 @@ impl Library {
             return;
         };
         let library = cx.weak_entity();
-        let epoch = self.epochs[Shelf::of(&playlist_id).slot()];
+        let epoch = self
+            .epochs
+            .get(&self.shelf_of(&playlist_id))
+            .copied()
+            .unwrap_or(0);
         let toast = Toast::new(Outcome::Done, "toast-track-moved")
             .name(name)
             .target(target)
@@ -2268,7 +2317,13 @@ impl Library {
                     (playlist_id.clone(), track_id.clone(), left.clone());
                 library
                     .update(cx, |this, cx| {
-                        if this.epochs[Shelf::of(&playlist_id).slot()] == epoch {
+                        if this
+                            .epochs
+                            .get(&this.shelf_of(&playlist_id))
+                            .copied()
+                            .unwrap_or(0)
+                            == epoch
+                        {
                             this.unmove(playlist_id, track_id, left, held, cx);
                         }
                     })
@@ -2311,7 +2366,7 @@ impl Library {
                 done: None,
                 name: None,
                 target: None,
-                shelf: Shelf::of(&playlist_id),
+                shelf: self.shelf_of(&playlist_id),
                 invalidated,
             },
             move |client| async move {
@@ -2420,7 +2475,7 @@ impl Library {
         let name = self
             .playlist(&playlist_id)
             .map(|playlist| playlist.name.clone());
-        let shelf = Shelf::of(&playlist_id);
+        let shelf = self.shelf_of(&playlist_id);
         self.mutate_playlist(
             PlaylistMutation {
                 action: "remove track from playlist",
@@ -2454,7 +2509,7 @@ impl Library {
                 done: Some("toast-playlist-deleted"),
                 name: None,
                 target: None,
-                shelf: Shelf::of(&id),
+                shelf: self.shelf_of(&id),
                 invalidated: vec![id.clone()],
             },
             move |client| async move { client.delete_playlist(&id).await },
@@ -2471,7 +2526,7 @@ impl Library {
                 done: Some("toast-playlist-added"),
                 name: None,
                 target: None,
-                shelf: Shelf::of(&id),
+                shelf: self.shelf_of(&id),
                 invalidated: vec![id.clone()],
             },
             move |client| async move { client.add_playlist_to_library(&id).await },
@@ -2491,10 +2546,10 @@ impl Library {
         let Some(first) = ids.first() else {
             return;
         };
-        let shelf = Shelf::of(first);
+        let shelf = self.shelf_of(first);
         let ids: Vec<String> = ids
             .into_iter()
-            .filter(|id| Shelf::of(id) == shelf)
+            .filter(|id| self.shelf_of(id) == shelf)
             .collect();
         let known: Vec<Playlist> = ids
             .iter()
@@ -2520,7 +2575,7 @@ impl Library {
                 for id in &removed {
                     this.forget_playlist(id, cx);
                 }
-                let epoch = this.epochs[shelf.slot()];
+                let epoch = this.epochs.get(&shelf).copied().unwrap_or(0);
                 let gone: Vec<Removed> = known
                     .into_iter()
                     .filter(|playlist| removed.contains(&playlist.id))
@@ -2544,7 +2599,7 @@ impl Library {
         let Some(first) = playlists.first() else {
             return;
         };
-        let shelf = Shelf::of(&first.id);
+        let shelf = self.shelf_of(&first.id);
         let ids: Vec<String> = playlists
             .iter()
             .map(|playlist| playlist.id.clone())
@@ -2614,7 +2669,11 @@ impl Library {
         }
         let library = cx.weak_entity();
         let playlist = playlist_id.to_owned();
-        let epoch = self.epochs[Shelf::of(playlist_id).slot()];
+        let epoch = self
+            .epochs
+            .get(&self.shelf_of(playlist_id))
+            .copied()
+            .unwrap_or(0);
         let back = tracks.clone();
         let toast = toast.undo(move |cx| {
             library
@@ -2643,7 +2702,13 @@ impl Library {
         epoch: u64,
         cx: &mut Context<Self>,
     ) {
-        if self.epochs[Shelf::of(&playlist_id).slot()] != epoch {
+        if self
+            .epochs
+            .get(&self.shelf_of(&playlist_id))
+            .copied()
+            .unwrap_or(0)
+            != epoch
+        {
             return;
         }
         self.raised_rows.remove(&playlist_id);
@@ -2657,7 +2722,7 @@ impl Library {
 
     /// A listed album, from the shelf's pages or its favorites.
     pub fn album(&self, id: &str) -> Option<&Album> {
-        let held = self.held(Shelf::of(id));
+        let held = self.held(self.shelf_of(id));
         held.state
             .albums()
             .iter()
@@ -2672,8 +2737,8 @@ impl Library {
     /// Gives each coverless streaming playlist the mosaic already on disk for it, and answers
     /// the ones still to build with their stamps. The list is written only when a mosaic is
     /// found, so a snapshot write holding it is not copied for nothing.
-    fn adopt_mosaics(&mut self) -> Vec<(String, u32)> {
-        let Some(ready) = self.held_mut(Shelf::Streaming).ready_mut() else {
+    fn adopt_mosaics(&mut self, slug: &'static str) -> Vec<(String, u32)> {
+        let Some(ready) = self.held_mut(Shelf::Account(slug)).ready_mut() else {
             return Vec::new();
         };
         let playlists = &mut ready.playlists;
@@ -2696,9 +2761,9 @@ impl Library {
         wanted
     }
 
-    fn build_mosaics(&mut self, cx: &mut Context<Self>) {
-        let wanted = self.adopt_mosaics();
-        let Some(client) = self.session.read(cx).client() else {
+    fn build_mosaics(&mut self, slug: &'static str, cx: &mut Context<Self>) {
+        let wanted = self.adopt_mosaics(slug);
+        let Some(client) = self.session.read(cx).client_of(Shelf::Account(slug)) else {
             return;
         };
 
@@ -2848,14 +2913,14 @@ impl Library {
     }
 
     pub fn playlist(&self, id: &str) -> Option<&Playlist> {
-        self.state(Shelf::of(id))
+        self.state(self.shelf_of(id))
             .playlists()
             .iter()
             .find(|playlist| playlist.id == id)
     }
 
     fn playlists_mut(&mut self, id: &str) -> Option<&mut Rows<Playlist>> {
-        self.held_mut(Shelf::of(id))
+        self.held_mut(self.shelf_of(id))
             .ready_mut()
             .map(|ready| &mut ready.playlists)
     }
@@ -2944,10 +3009,10 @@ impl Library {
 
     /// Forgets a playlist on the shelf and in the pin snapshot, notifying listeners of its removal.
     fn forget_playlist(&mut self, id: &str, cx: &mut Context<Self>) {
-        if let Some(targets) = self.pin_targets.as_mut() {
+        for targets in self.pin_targets.values_mut() {
             targets.retain(|target| {
                 target.kind != music::PinTargetKind::Playlist
-                    || target.uri.rsplit_once(':').map(|(_, id)| id) != Some(id)
+                    || target.uri.rsplit_once(':').map(|(_, raw)| raw) != Some(id)
             });
         }
         cx.emit(LibraryEvent::PlaylistGone(id.to_owned()));
@@ -3011,7 +3076,7 @@ impl Library {
         let Some(id) = track.id.clone() else {
             return;
         };
-        let Some(favorites) = self.held_mut(Shelf::of(&id)).favorites_mut() else {
+        let Some(favorites) = self.held_mut(self.shelf_of(&id)).favorites_mut() else {
             return;
         };
         let tracks = favorites.tracks;
@@ -3032,28 +3097,37 @@ impl Library {
         listed: bool,
         cx: &mut Context<Self>,
     ) {
+        let shelf = playlists.iter().next().map(|id| self.shelf_of(id));
         for id in playlists {
             self.reading.remove(&id);
             self.contents.remove(&id);
             cx.emit(LibraryEvent::PlaylistChanged(id));
         }
         match listed {
-            true => self.refresh(Shelf::Streaming, cx),
+            true => {
+                if let Some(shelf) = shelf {
+                    self.refresh(shelf, cx);
+                }
+            }
             false => {
-                // a change that only names a playlist may still have moved the pins
-                self.sync_pin_targets(cx);
-                self.relist(cx);
+                if let Some(shelf) = shelf {
+                    // a change that only names a playlist may still have moved the pins
+                    if let Shelf::Account(slug) = shelf {
+                        self.sync_pin_targets(slug, cx);
+                    }
+                    self.relist(shelf, cx);
+                }
             }
         }
     }
 
-    /// Reads the streaming shelf's playlists again and leaves its other parts as they are. A
-    /// shelf still loading brings its playlists anyway, so nothing more is asked of it.
-    fn relist(&mut self, cx: &mut Context<Self>) {
-        let Some(client) = self.session.read(cx).client_of(Shelf::Streaming) else {
+    /// Reads a shelf's playlists again and leaves its other parts as they are. A shelf still
+    /// loading brings its playlists anyway, so nothing more is asked of it.
+    fn relist(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
+        let Some(client) = self.session.read(cx).client_of(shelf) else {
             return;
         };
-        let held = self.held_mut(Shelf::Streaming);
+        let held = self.held_mut(shelf);
         if !matches!(held.state, LibraryState::Ready(_))
             || held.awaited.contains(&LibraryPart::Playlists)
         {
@@ -3062,17 +3136,17 @@ impl Library {
         held.stale.insert(LibraryPart::Playlists);
         self.relisting = Some(self.io.load(
             async move { client.playlists().await },
-            |this, loaded, cx| {
+            move |this, loaded, cx| {
                 this.relisting = None;
                 // a failed read leaves the playlists on screen as they were, with no problem
                 // noted that only a full refresh would clear
                 match loaded {
                     Ok(playlists) => {
-                        this.land(Shelf::Streaming, Landed::Playlists(Ok(playlists)), cx)
+                        this.land(shelf, Landed::Playlists(Ok(playlists)), cx)
                     }
                     Err(error) => {
                         log::warn!("library: cannot read the changed playlists: {error:#}");
-                        this.held_mut(Shelf::Streaming)
+                        this.held_mut(shelf)
                             .stale
                             .remove(&LibraryPart::Playlists);
                     }
@@ -3086,8 +3160,8 @@ impl Library {
     /// until all of its new rows have arrived, and its old problems are dropped so the fresh rows
     /// can be snapshotted.
     pub fn refresh(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
-        if shelf == Shelf::Streaming {
-            self.sync_pin_targets(cx);
+        if let Shelf::Account(slug) = shelf {
+            self.sync_pin_targets(slug, cx);
         }
         let held = self.held_mut(shelf);
         if let LibraryState::Ready(ready) = &mut held.state {
@@ -3104,7 +3178,7 @@ impl Library {
     pub fn reload(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
         self.held_mut(shelf).stale.clear();
         match shelf {
-            Shelf::Streaming => self.sync_pin_targets(cx),
+            Shelf::Account(slug) => self.sync_pin_targets(slug, cx),
             Shelf::Local if !self.session.read(cx).local_paths().is_empty() => {
                 self.rescan_local(false, cx);
                 return;
@@ -3123,7 +3197,7 @@ impl Library {
     /// load; only a new sign-in drops them.
     fn load(&mut self, shelf: Shelf, cx: &mut Context<Self>) {
         // a full load lands the playlists too, and two of them would list each one twice
-        if shelf == Shelf::Streaming {
+        if matches!(shelf, Shelf::Account(_)) {
             self.relisting = None;
         }
         let session = self.session.read(cx);
@@ -3131,6 +3205,12 @@ impl Library {
             return;
         };
         let shape = session.shape_of(shelf);
+        if matches!(shelf, Shelf::Account(_)) {
+            self.playlist_task = None;
+            self.pending.clear();
+            self.pending_albums.clear();
+            self.pending_artists.clear();
+        }
 
         let held = self.held_mut(shelf);
         held.shape = shape;
@@ -3322,15 +3402,23 @@ impl Library {
         // moved, or that is gone, drops them here and the read below fetches them afresh.
         if let Some(before) = before {
             let fresh = counts(self);
-            self.contents.retain(|id, _| {
-                Shelf::of(id) != shelf
-                    || (fresh.contains_key(id) && fresh.get(id) == before.get(id))
-            });
+            let stale: Vec<String> = self
+                .contents
+                .keys()
+                .filter(|id| {
+                    self.shelf_of(id) == shelf
+                        && !(fresh.contains_key(*id) && fresh.get(*id) == before.get(*id))
+                })
+                .cloned()
+                .collect();
+            for id in stale {
+                self.contents.remove(&id);
+            }
         }
         if part == LibraryPart::Playlists {
             self.read_playlists(shelf, cx);
-            if shelf == Shelf::Streaming {
-                self.build_mosaics(cx);
+            if let Shelf::Account(slug) = shelf {
+                self.build_mosaics(slug, cx);
             }
         }
         cx.notify();

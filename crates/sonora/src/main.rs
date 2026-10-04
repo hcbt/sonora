@@ -152,10 +152,26 @@ fn main() -> ExitCode {
         state::install_rounded_window_hook(set_corner_preference, cx);
         #[cfg(target_os = "macos")]
         state::install_rounded_window_hook(set_toolbar_style, cx);
-        let startup = Sonora::global(cx).settings.read(cx).startup().to_owned();
-        let start = Screen::from_id(&startup)
-            .unwrap_or(Screen::Home)
-            .destination();
+        let start = {
+            let startup = Sonora::global(cx).settings.read(cx).startup().to_owned();
+            let screen = Screen::from_id(&startup).unwrap_or(Screen::Home);
+            match screen.library_tab() {
+                Some(tab) => {
+                    let account = Sonora::global(cx)
+                        .session
+                        .read(cx)
+                        .stored_libraries()
+                        .into_iter()
+                        .next()
+                        .unwrap_or("spotify");
+                    Destination::Library {
+                        account: account.into(),
+                        tab,
+                    }
+                }
+                None => screen.destination(),
+            }
+        };
         router::init(start, cx);
         let (look, overrides, language, pack, stillness, pace, remembered) = {
             let settings = Sonora::global(cx).settings.read(cx);
@@ -601,4 +617,16 @@ unsafe extern "system" fn work_area(
 #[cfg(not(target_os = "windows"))]
 fn platform_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_percent_before_a_multibyte_letter_stays_in_the_path() {
+        assert_eq!(percent_decode("%가나"), "%가나");
+        assert_eq!(percent_decode("%a가"), "%a가");
+        assert_eq!(percent_decode("a%20b%EA%B0%80"), "a b가");
+    }
 }

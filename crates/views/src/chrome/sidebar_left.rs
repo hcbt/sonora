@@ -23,7 +23,7 @@ use state::{
 };
 
 use crate::shared::menus::{ItemMenu, item_menu};
-use crate::shared::nav::{nav_icon, nav_row};
+use crate::shared::nav::{named_row, nav_icon, nav_row};
 use crate::shared::pins::leaving;
 use crate::shared::playlist_editor::{Edit, PlaylistEditor};
 
@@ -43,7 +43,7 @@ pub(crate) const NAV: [(Option<NavEntry>, &str, Destination); 6] = [
     (
         Some(NavEntry::Library),
         "icons/library-big.svg",
-        Destination::Library(LibraryTab::Songs),
+        Destination::Home,
     ),
     (
         Some(NavEntry::Local),
@@ -83,19 +83,15 @@ const RAIL_INSET: f32 = 0.5;
 const FLYOUT_GAP: Pixels = px(4.);
 const BORDER: Pixels = px(1.);
 
-/// The two navigation entries that expand into tabs rather than navigate.
+/// Local Music expands into tabs. Each signed-in account does the same, beside it.
 #[derive(Clone, Copy, PartialEq)]
 enum Group {
-    Library,
     Local,
 }
 
 impl Group {
-    const ALL: [Self; 2] = [Self::Library, Self::Local];
-
     fn of(destination: &Destination) -> Option<Self> {
         match destination {
-            Destination::Library(_) => Some(Self::Library),
             Destination::Local(_) => Some(Self::Local),
             _ => None,
         }
@@ -104,7 +100,6 @@ impl Group {
     /// The Fluent key of the group's name, which also keys the menu it opens on the rail.
     fn key(self) -> &'static str {
         match self {
-            Self::Library => "nav-library",
             Self::Local => "nav-local",
         }
     }
@@ -112,7 +107,6 @@ impl Group {
     /// Where `tab` of the group leads.
     fn at(self, tab: LibraryTab) -> Destination {
         match self {
-            Self::Library => Destination::Library(tab),
             Self::Local => Destination::Local(tab),
         }
     }
@@ -137,7 +131,7 @@ pub(crate) struct SidebarLeft {
     grabbed: Option<(Pixels, bool)>,
     /// Whether an edge drag is held below half the rail, which closes the sidebar on release.
     closing: bool,
-    library_open: bool,
+    accounts_open: Vec<String>,
     local_open: bool,
     pinned_open: bool,
     dropping: bool,
@@ -188,7 +182,10 @@ impl SidebarLeft {
         .detach();
 
         let at = trail.read(cx).current();
-        let library_open = matches!(at, Destination::Library(_));
+        let mut accounts_open = Vec::new();
+        if let Destination::Library { account, .. } = &at {
+            accounts_open.push(account.to_string());
+        }
         let local_open = matches!(at, Destination::Local(_));
 
         Self {
@@ -205,7 +202,7 @@ impl SidebarLeft {
             cramped: false,
             grabbed: None,
             closing: false,
-            library_open,
+            accounts_open,
             local_open,
             pinned_open,
             dropping: false,
@@ -226,9 +223,30 @@ impl SidebarLeft {
             return;
         }
         self.at = current.clone();
-        let (library, local) = expanded(current);
-        self.library_open |= library;
-        self.local_open |= local;
+        if let Destination::Library { account, .. } = current {
+            self.open_account(account);
+        }
+        self.local_open |= matches!(current, Destination::Local(_));
+    }
+
+    fn open_account(&mut self, slug: &str) {
+        if self.accounts_open.iter().any(|open| open == slug) {
+            return;
+        }
+        self.accounts_open.push(slug.to_owned());
+    }
+
+    fn account_open(&self, slug: &str) -> bool {
+        self.accounts_open.iter().any(|open| open == slug)
+    }
+
+    fn flip_account(&mut self, slug: &str) {
+        match self.accounts_open.iter().position(|open| open == slug) {
+            Some(index) => {
+                self.accounts_open.remove(index);
+            }
+            None => self.accounts_open.push(slug.to_owned()),
+        }
     }
 
     fn dismiss_menu(&mut self, cx: &mut Context<Self>) {
@@ -382,19 +400,25 @@ impl SidebarLeft {
     /// The navigation entries, each followed by its tabs while its group is open. The rail lists
     /// the entries alone, since a group there opens its tabs in a menu beside it.
     fn navigation(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        // A shelf with rows on it belongs in the sidebar even before the session has restored,
-        // since a snapshot fills it while the provider is still answering.
-        let stocked = self.session.read(cx).authenticated()
-            || self.library.read(cx).stocked(Shelf::Streaming);
+        let show_libraries = self.settings.read(cx).nav_shown(NavEntry::Library.id());
+        let accounts = self.library_rows(cx);
         let mut rows = Vec::new();
-        for (index, (entry, _, destination)) in NAV.iter().enumerate() {
+        for (index, (entry, _, _)) in NAV.iter().enumerate() {
             if entry.is_some_and(|entry| !self.settings.read(cx).nav_shown(entry.id())) {
                 continue;
             }
-            let group = Group::of(destination);
-            if group == Some(Group::Library) && !stocked {
+            if entry == &Some(NavEntry::Library) {
+                if show_libraries {
+                    for (slug, name) in &accounts {
+                        rows.push(self.account_nav(slug, name, window, cx));
+                        if !self.folded() && self.account_open(slug) {
+                            rows.push(self.account_tabs(slug, cx));
+                        }
+                    }
+                }
                 continue;
             }
+            let group = Group::of(&NAV[index].2);
             rows.push(self.nav(index, window, cx));
             if let Some(group) = group.filter(|group| !self.folded() && self.opened(*group)) {
                 rows.push(self.tabs(group, cx));
@@ -403,7 +427,22 @@ impl SidebarLeft {
         rows
     }
 
-    /// The pinned section: its header, and its entries once it is expanded.
+    /// Signed-in libraries, plus a stored one whose snapshot is already on screen.
+    fn library_rows(&self, cx: &App) -> Vec<(&'static str, &'static str)> {
+        let session = self.session.read(cx);
+        let library = self.library.read(cx);
+        session
+            .stored_libraries()
+            .into_iter()
+            .filter(|slug| {
+                session.account_authenticated(slug) || library.stocked(Shelf::Account(slug))
+            })
+            .filter_map(|slug| session.name_of(slug).map(|name| (slug, name)))
+            .collect()
+    }
+
+    /// The pinned section: its header, and its entries once it is expanded. The entries are a
+    /// `Deck`, so only the ones on screen are ever built.
     fn pins(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         if !self.settings.read(cx).nav_shown(NavEntry::Pins.id()) {
             return Vec::new();
@@ -458,14 +497,12 @@ impl SidebarLeft {
 
     fn opened(&self, group: Group) -> bool {
         match group {
-            Group::Library => self.library_open,
             Group::Local => self.local_open,
         }
     }
 
     fn flip(&mut self, group: Group) {
         let open = match group {
-            Group::Library => &mut self.library_open,
             Group::Local => &mut self.local_open,
         };
         *open = !*open;
@@ -818,20 +855,14 @@ impl SidebarLeft {
                 .on_click(move |_, _, cx| navigate(destination.clone(), cx))
         };
 
-        Tabs::new()
-            .items(
-                LIBRARY_TABS
-                    .into_iter()
-                    .enumerate()
-                    .map(|(slot, (name, tab_id))| {
-                        let id = match group {
-                            Group::Library => name.into(),
-                            Group::Local => ("local-tab", slot).into(),
-                        };
-                        tab(id, name, group.at(tab_id))
-                    }),
-            )
-            .into_any_element()
+        match group {
+            Group::Local => Tabs::new().items(LIBRARY_TABS.into_iter().enumerate().map(
+                |(slot, (name, tab_id))| {
+                    tab(("local-tab", slot).into(), name, Destination::Local(tab_id))
+                },
+            )),
+        }
+        .into_any_element()
     }
 
     /// Whether `target` takes the dragged `song`: a playlist the listener may edit, on the same
@@ -839,7 +870,7 @@ impl SidebarLeft {
     fn accepts(&self, song: &Pin, target: &Pin, cx: &App) -> bool {
         song.kind == PinKind::Song
             && target.kind == PinKind::Playlist
-            && Shelf::of(&song.id) == Shelf::of(&target.id)
+            && self.session.read(cx).shelf_of(&song.id) == self.session.read(cx).shelf_of(&target.id)
             && self.library.read(cx).is_editable(&target.id)
     }
 
@@ -879,7 +910,8 @@ impl SidebarLeft {
         let library = self.library.read(cx);
         match leaving(song.origin.as_deref()?) {
             Leaving::Liked => {
-                (library.shape(Shelf::Streaming) == Shape::Saved).then_some(Leaving::Liked)
+                let shelf = self.session.read(cx).shelf_of(&song.id);
+                (library.shape(shelf) == Shape::Saved).then_some(Leaving::Liked)
             }
             Leaving::Playlist(id) => {
                 (id != target && library.is_editable(&id)).then_some(Leaving::Playlist(id))
@@ -887,6 +919,126 @@ impl SidebarLeft {
         }
     }
 
+    fn account_nav(
+        &self,
+        slug: &'static str,
+        name: &'static str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let accent = theme.sidebar_accent;
+        let current = self.trail.read(cx).current();
+        let active = matches!(
+            &current,
+            Destination::Library { account, .. } if account.as_ref() == slug
+        );
+        let tint = match active {
+            true => theme.foreground,
+            false => theme.muted_foreground,
+        };
+        let open = self.account_open(slug);
+        let folded = self.folded();
+        let row = match folded {
+            true => nav_icon(
+                SharedString::from(format!("library-{slug}")),
+                name,
+                crate::shared::provider_logo(slug),
+                tint,
+                accent,
+            ),
+            false => named_row(
+                SharedString::from(format!("library-{slug}")),
+                name,
+                tint,
+                accent,
+            )
+            .icon(crate::shared::provider_logo(slug))
+            .trailing(chevron(open)),
+        };
+        match folded {
+            true => self.account_flyout(slug, name, row.lit(active, accent), window, cx),
+            false => row
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.flip_account(slug);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        }
+    }
+
+    /// An account's entry on the rail. `button` opens a menu just past the rail's edge that
+    /// names the account and lists its tabs, each with its glyph and full name, and picking one
+    /// navigates there.
+    fn account_flyout(
+        &self,
+        slug: &'static str,
+        name: &'static str,
+        button: Button,
+        window: &Window,
+        cx: &App,
+    ) -> AnyElement {
+        let current = self.trail.read(cx).current();
+        let gap = window.rem_size() * RAIL_INSET + BORDER + FLYOUT_GAP;
+        let account = SharedString::from(slug);
+        let items = LIBRARY_TABS.into_iter().map(|(key, tab)| {
+            let destination = Destination::Library {
+                account: account.clone(),
+                tab,
+            };
+            MenuItem::new(key, i18n::lookup(key, None))
+                .icon(tab.icon())
+                .selected(destination == current)
+                .on_click(move |_, _, cx| navigate(destination.clone(), cx))
+        });
+        let menu = Menu::new(slug)
+            .name(name)
+            .w(Picker::NARROW)
+            .beside(gap)
+            .header(ui::eyebrow(name, cx).px_3().pt_1())
+            .items(items);
+
+        Popover::new(slug, self.popovers.clone())
+            .button(button)
+            .menu(menu)
+            .commands()
+            .w_full()
+            .into_any_element()
+    }
+
+    fn account_tabs(&self, slug: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let accent = theme.sidebar_accent;
+        let current = self.trail.read(cx).current();
+        let account = SharedString::from(slug);
+        Tabs::new()
+            .items(
+                LIBRARY_TABS
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, (name, tab))| {
+                        let destination = Destination::Library {
+                            account: account.clone(),
+                            tab,
+                        };
+                        let chosen = destination == current;
+                        let tint = match chosen {
+                            true => theme.foreground,
+                            false => theme.muted_foreground,
+                        };
+                        named_row(
+                            SharedString::from(format!("library-tab-{slug}-{slot}")),
+                            i18n::lookup(name, None),
+                            tint,
+                            accent,
+                        )
+                        .flex_1()
+                        .when(chosen, |button| button.bg(accent))
+                        .on_click(move |_, _, cx| navigate(destination.clone(), cx))
+                    }),
+            )
+            .into_any_element()
+    }
     fn persist(&self, cx: &mut Context<Self>) {
         let width = self.width / px(1.);
         let open = self.open;
@@ -922,9 +1074,11 @@ impl Render for SidebarLeft {
         let rail = self.folded();
         // A group's menu belongs to the rail, so one left open must not come back with it.
         if !rail
-            && Group::ALL
-                .iter()
-                .any(|group| self.popovers.shows(group.key()))
+            && (self.popovers.shows(Group::Local.key())
+                || self
+                    .library_rows(cx)
+                    .iter()
+                    .any(|(slug, _)| self.popovers.shows(slug)))
         {
             self.popovers.close();
         }
@@ -1103,12 +1257,13 @@ fn vacancy() -> AnyElement {
         .into_any_element()
 }
 
-/// Which groups the route opens: Your Library and Local Music, in that order.
-fn expanded(current: &Destination) -> (bool, bool) {
-    (
-        matches!(current, Destination::Library(_)),
-        matches!(current, Destination::Local(_)),
-    )
+#[cfg(test)]
+fn expanded(current: &Destination) -> (Option<&str>, bool) {
+    match current {
+        Destination::Library { account, .. } => (Some(account.as_ref()), false),
+        Destination::Local(_) => (None, true),
+        _ => (None, false),
+    }
 }
 
 fn chevron(open: bool) -> &'static str {
@@ -1127,16 +1282,19 @@ mod tests {
     #[test]
     fn a_section_expands_only_where_it_leads() {
         assert_eq!(
-            expanded(&Destination::Library(LibraryTab::Albums)),
-            (true, false)
+            expanded(&Destination::Library {
+                account: "spotify".into(),
+                tab: LibraryTab::Albums,
+            }),
+            (Some("spotify"), false)
         );
         assert_eq!(
             expanded(&Destination::Local(LibraryTab::Albums)),
-            (false, true)
+            (None, true)
         );
         assert_eq!(
-            expanded(&Destination::Settings(SettingsPage::Providers)),
-            (false, false)
+            expanded(&Destination::Settings(SettingsPage::General)),
+            (None, false)
         );
     }
 
@@ -1152,7 +1310,7 @@ mod tests {
         ];
 
         for destination in away {
-            assert_eq!(expanded(&destination), (false, false), "{destination:?}");
+            assert_eq!(expanded(&destination), (None, false), "{destination:?}");
         }
     }
 }

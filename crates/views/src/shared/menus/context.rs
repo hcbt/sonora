@@ -339,7 +339,10 @@ impl ItemMenu {
         };
         let shelf = match imported {
             true => Shelf::Local,
-            false => Shelf::Streaming,
+            false => ids
+                .first()
+                .and_then(|id| Sonora::global(cx).session.read(cx).shelf_for(id))
+                .unwrap_or(Shelf::Local),
         };
         let copy = (!many)
             .then(|| copy_link_item("copy-track-link", MediaKind::Track, track.id.as_deref(), cx));
@@ -371,7 +374,13 @@ impl ItemMenu {
         );
         // A provider that lists no station tracks gets no station item at all, rather than one
         // that plays the seed and stops.
-        let stations = Sonora::global(cx).session.read(cx).capabilities().radio;
+        let stations = track.id.as_deref().is_some_and(|id| {
+            Sonora::global(cx)
+                .session
+                .read(cx)
+                .capabilities_for(id)
+                .radio
+        });
         let radio = match (many || !stations, track.id.is_some() && track.playable) {
             (true, _) => None,
             (false, true) => {
@@ -892,7 +901,10 @@ fn track_download_tile(tracks: &[Track], ids: &[String], cx: &App) -> Option<Til
         () if states.contains(&Some(Progress::Failed)) => Some(Progress::Failed),
         () => None,
     };
-    if progress.is_none() && !sonora.session.read(cx).capabilities().downloads {
+    let downloads_allowed = ids
+        .first()
+        .is_some_and(|id| sonora.session.read(cx).capabilities_for(id).downloads);
+    if progress.is_none() && !downloads_allowed {
         return None;
     }
     let done = match ids {
@@ -935,7 +947,7 @@ fn set_download_tile(saved: Saved, cx: &App) -> Option<Tile> {
     let sonora = Sonora::global(cx);
     let downloads = sonora.downloads.clone();
     let progress = downloads.read(cx).set(kind, &id);
-    if progress.is_none() && !sonora.session.read(cx).capabilities().downloads {
+    if progress.is_none() && !sonora.session.read(cx).capabilities_for(&id).downloads {
         return None;
     }
     let done = Some(downloads.read(cx).share(kind, &id));
@@ -973,11 +985,10 @@ fn album_tiles(album: &Album, cx: &App) -> Vec<Tile> {
             })
         });
 
-    let editable = sonora
-        .session
-        .read(cx)
-        .shape_of(Shelf::of(&album.id))
-        .editable();
+    let session = sonora.session.read(cx);
+    let editable = session
+        .shelf_for(&album.id)
+        .is_some_and(|shelf| session.shape_of(shelf).editable());
     let shelved = editable.then(|| {
         let present = state.in_library(&album.id);
         Tile::new("tile-library", "icons/library-big.svg", "menu-save-library")
@@ -1017,7 +1028,11 @@ pub(crate) fn album_menu(
         .submenu(
             menus.playlist_rows(
                 Addition::Album(album_id.clone()),
-                Shelf::of(&album_id),
+                Sonora::global(cx)
+                    .session
+                    .read(cx)
+                    .shelf_for(&album_id)
+                    .unwrap_or(Shelf::Local),
                 Vec::new(),
                 cx,
             ),
@@ -1051,7 +1066,7 @@ fn artist_tiles(artist: &SavedArtist, cx: &App) -> Vec<Tile> {
     let follow = sonora
         .session
         .read(cx)
-        .capabilities()
+        .capabilities_for(&artist.id)
         .follow_artists
         .then(|| {
             let state = sonora.library.read(cx);
@@ -1408,10 +1423,11 @@ fn media_kind(kind: PinKind) -> MediaKind {
 }
 
 fn saved_track(id: &str, cx: &App) -> Option<Track> {
+    let shelf = Sonora::global(cx).session.read(cx).shelf_for(id)?;
     Sonora::global(cx)
         .library
         .read(cx)
-        .state(Shelf::of(id))
+        .state(shelf)
         .tracks()
         .iter()
         .find(|track| track.id.as_deref() == Some(id))
@@ -1438,12 +1454,14 @@ fn share_link(kind: MediaKind, id: Option<&str>, cx: &App) -> Result<String, &'s
     };
     let local = music::is_local_id(id);
     let session = Sonora::global(cx).session.read(cx);
-    let client = match local {
-        true => session.local_client(),
-        false => session.client(),
+    let Some(client) = session.client_for(id) else {
+        return Err(match local {
+            true => "menu-copy-link-local",
+            false => "menu-copy-link-none",
+        });
     };
     client
-        .and_then(|client| client.share_url(kind, id))
+        .share_url(kind, id)
         .ok_or(match local {
             true => "menu-copy-link-local",
             false => "menu-copy-link-none",

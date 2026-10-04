@@ -922,6 +922,8 @@ fn language_code(code: &str) -> String {
         _ => return code.to_owned(),
     };
     short.to_owned()
+}
+
 fn file_rhythm(tag: Option<&Tag>) -> TrackRhythm {
     let Some(tag) = tag else {
         return TrackRhythm::default();

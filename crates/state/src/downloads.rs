@@ -246,14 +246,14 @@ impl Downloads {
         cx.subscribe(network, |this, _, _: &Reconnected, cx| this.resume(cx))
             .detach();
         cx.subscribe(&session, |this, session, event, cx| match event {
-            SessionEvent::SignedIn | SessionEvent::Reconnected => {
+            SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) => {
                 let provider = session.read(cx).provider_slug();
                 this.adopt(provider, cx);
                 this.failed.clear();
                 this.requeue();
                 this.pump(cx);
             }
-            SessionEvent::SignedOut => this.clear(cx),
+            SessionEvent::SignedOut(_) => this.clear(cx),
             SessionEvent::WentOffline => this.halt(cx),
             SessionEvent::LocalChanged => {}
         })

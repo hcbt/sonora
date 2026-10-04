@@ -304,10 +304,10 @@ impl SettingsView {
         let session = self.session.read(cx);
         let signed_out = matches!(session.state(), SessionState::SignedOut);
         let guest = !session.authenticated();
-        let waiting = match session.state() {
-            SessionState::Authorizing(prompt) => !matches!(prompt, Some(SignInPrompt::Accounts(_))),
-            _ => false,
-        };
+        let waiting = !matches!(
+            super::sign_in_prompt(session),
+            None | Some(SignInPrompt::Accounts(_))
+        );
         let loading = session.is_pending();
         let chosen = self.chosen.filter(|_| loading);
         session
@@ -581,10 +581,7 @@ impl SettingsView {
             self.close_scrobble(cx);
             return true;
         }
-        let prompted = matches!(
-            self.session.read(cx).state(),
-            SessionState::Authorizing(Some(_))
-        );
+        let prompted = super::sign_in_prompt(self.session.read(cx)).is_some();
         if prompted {
             self.abandon(cx);
             return true;

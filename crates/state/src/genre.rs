@@ -8,7 +8,7 @@ use music::{Genre, GenreDetail, GenreSection, MusicApi};
 use serde::Deserialize;
 use tokio::task::AbortHandle;
 
-use crate::{Io, Session, SessionEvent, join, trim_heap};
+use crate::{Io, Session, SessionEvent, Shelf, join, trim_heap};
 
 /// How many bare genres get a picture fetched for them, which covers the first screens of tiles.
 const DRESSED: usize = 48;
@@ -35,6 +35,7 @@ pub struct Genres {
     task: Option<Task<()>>,
     /// Fetches the pictures of genres the provider listed without one.
     dressing: Option<Task<()>>,
+    generation: u64,
 }
 
 /// The pictures a provider's genres were last dressed with, as `cache.sqlite` keeps them.
@@ -47,17 +48,15 @@ struct Stored {
 impl Genres {
     pub fn new(session: Entity<Session>, io: Io, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn if this.wanted => this.load(cx),
-            SessionEvent::SignedIn => {}
-            SessionEvent::SignedOut => {
-                this.task = None;
-                this.dressing = None;
-                this.genres = Rc::new(Vec::new());
-                this.loading = false;
-                this.error = None;
-                cx.notify();
+            SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) if this.wanted => {
+                this.reload(cx);
             }
-            SessionEvent::Reconnected | SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
+            SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) => {}
+            SessionEvent::SignedOut(slug) => {
+                this.dressing = None;
+                this.drop_account(slug, cx);
+            }
+            SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -71,6 +70,7 @@ impl Genres {
             cache: storage::Cache::standard(),
             task: None,
             dressing: None,
+            generation: 0,
         }
     }
 
@@ -116,27 +116,65 @@ impl Genres {
         if self.loading || !self.genres.is_empty() {
             return;
         }
-        let Some(client) = self.session.read(cx).client() else {
-            return;
-        };
+        self.reload(cx);
+    }
 
-        self.loading = true;
-        self.error = None;
-        cx.notify();
+    fn drop_account(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let before = self.genres.len();
+        Rc::make_mut(&mut self.genres)
+            .retain(|genre| self.session.read(cx).slug_for(&genre.id) != Some(slug));
+        if self.genres.len() != before {
+            cx.notify();
+        }
+    }
+
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        let clients = streaming_clients(self.session.read(cx));
+        if clients.is_empty() {
+            return;
+        }
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        if self.genres.is_empty() {
+            self.loading = true;
+            self.error = None;
+            cx.notify();
+        }
 
         let io = self.io.clone();
         self.task = Some(cx.spawn(async move |this, cx| {
-            let lister = client.clone();
-            let loaded = join(io.spawn(async move { lister.genres().await })).await;
+            let mut merged = Vec::new();
+            let mut failed = None;
+            for client in clients {
+                match join(io.spawn(async move { client.genres().await })).await {
+                    Ok(genres) => merged.extend(genres),
+                    Err(error) => failed = Some(error),
+                }
+            }
 
             this.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
                 this.loading = false;
-                match crate::settled(loaded, cx) {
-                    Ok(genres) => {
-                        this.genres = Rc::new(genres);
-                        this.dress(client, cx);
+                this.task = None;
+                {
+                    let session = this.session.read(cx);
+                    merged.retain(|genre| {
+                        session
+                            .slug_for(&genre.id)
+                            .is_some_and(|slug| session.account_authenticated(slug))
+                    });
+                }
+                match failed {
+                    Some(error) if merged.is_empty() => {
+                        this.error = Some(crate::settled::<()>(Err(error), cx).unwrap_err());
                     }
-                    Err(reason) => this.error = Some(reason),
+                    _ => {
+                        this.error = None;
+                        this.genres = Rc::new(merged);
+                        this.dress(cx);
+                    }
                 }
                 cx.notify();
             })
@@ -144,79 +182,102 @@ impl Genres {
         }));
     }
 
-    /// Puts pictures on the first genres the provider listed without one. Pictures stored for this
+    /// Puts pictures on the first genres each provider listed without one. Pictures stored for a
     /// provider within `KEEP_COVERS` go on at once, and the rest are fetched a few at a time and
     /// stored for the next launch. A genre whose picture cannot be found keeps the placeholder.
-    fn dress(&mut self, client: Arc<dyn MusicApi>, cx: &mut Context<Self>) {
-        let listed: Vec<String> = self
+    fn dress(&mut self, cx: &mut Context<Self>) {
+        let session = self.session.read(cx);
+        let mut listed: HashMap<&'static str, (Arc<dyn MusicApi>, Vec<String>)> = HashMap::new();
+        for genre in self
             .genres
             .iter()
             .filter(|genre| genre.cover.is_none())
             .take(DRESSED)
-            .map(|genre| genre.id.clone())
-            .collect();
+        {
+            let Some(slug) = session.slug_for(&genre.id) else {
+                continue;
+            };
+            let Some(client) = session.client_of(Shelf::Account(slug)) else {
+                continue;
+            };
+            listed
+                .entry(slug)
+                .or_insert_with(|| (client, Vec::new()))
+                .1
+                .push(genre.id.clone());
+        }
         if listed.is_empty() {
             return;
         }
 
-        let slug = self.session.read(cx).provider_slug();
         let cache = self.cache.clone();
         let io = self.io.clone();
         self.dressing = Some(cx.spawn(async move |this, cx| {
-            let stored = match slug {
-                Some(slug) => {
+            let mut known: HashMap<&'static str, Covers> = HashMap::new();
+            let mut bare: Vec<(&'static str, Arc<dyn MusicApi>, Vec<String>)> = Vec::new();
+            for (slug, (client, ids)) in listed {
+                let stored = {
                     let cache = cache.clone();
                     io.spawn_blocking(move || remembered(&cache, slug))
                         .await
                         .unwrap_or_default()
-                }
-                None => Covers::new(),
-            };
-            let mut known: Covers = listed
-                .iter()
-                .filter_map(|id| Some((id.clone(), stored.get(id)?.clone())))
-                .collect();
-            let bare: Vec<String> = listed
-                .into_iter()
-                .filter(|id| !known.contains_key(id))
-                .collect();
-            let kept = this.update(cx, |this, cx| {
-                for (id, cover) in &known {
-                    this.adopt(id, cover.clone(), cx);
-                }
-            });
-            if kept.is_err() || bare.is_empty() {
-                return;
-            }
-
-            for batch in bare.chunks(AT_ONCE) {
-                let asked = batch.iter().map(|id| {
-                    let client = client.clone();
-                    let id = id.clone();
-                    join(io.spawn(async move { client.genre_cover(&id).await }))
-                });
-                let found = futures::future::join_all(asked).await;
-                let kept = this.update(cx, |this, cx| {
-                    for (id, cover) in batch.iter().zip(found) {
-                        match cover {
-                            Ok(cover) => {
-                                this.adopt(id, cover.clone(), cx);
-                                known.insert(id.clone(), cover);
-                            }
-                            Err(error) => log::debug!("genres: no picture for {id}: {error:#}"),
+                };
+                let mut kept = Covers::new();
+                let mut missing = Vec::new();
+                for id in ids {
+                    match stored.get(&id) {
+                        Some(cover) => {
+                            kept.insert(id, cover.clone());
                         }
+                        None => missing.push(id),
+                    }
+                }
+                let adopted = kept.clone();
+                let applied = this.update(cx, |this, cx| {
+                    for (id, cover) in &adopted {
+                        this.adopt(id, cover.clone(), cx);
                     }
                 });
-                if kept.is_err() {
+                if applied.is_err() {
                     return;
+                }
+                known.insert(slug, kept);
+                if !missing.is_empty() {
+                    bare.push((slug, client, missing));
+                }
+            }
+
+            for (slug, client, ids) in bare {
+                for batch in ids.chunks(AT_ONCE) {
+                    let asked = batch.iter().map(|id| {
+                        let client = client.clone();
+                        let id = id.clone();
+                        join(io.spawn(async move { client.genre_cover(&id).await }))
+                    });
+                    let found = futures::future::join_all(asked).await;
+                    let applied = this.update(cx, |this, cx| {
+                        let known = known.entry(slug).or_default();
+                        for (id, cover) in batch.iter().zip(found) {
+                            match cover {
+                                Ok(cover) => {
+                                    this.adopt(id, cover.clone(), cx);
+                                    known.insert(id.clone(), cover);
+                                }
+                                Err(error) => log::debug!("genres: no picture for {id}: {error:#}"),
+                            }
+                        }
+                    });
+                    if applied.is_err() {
+                        return;
+                    }
                 }
             }
 
             // A provider may answer with whole pages to find one picture each, and what parsing
             // them freed would otherwise stay resident.
             io.spawn_blocking(move || {
-                if let Some(slug) = slug {
-                    remember(&cache, slug, &known);
+                for (slug, covers) in known {
+                    remember(&cache, slug, &covers);
                 }
                 trim_heap();
             })
@@ -247,17 +308,29 @@ impl GenreDetails {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn => {
-                if let Some(id) = this.id.clone() {
+            SessionEvent::SignedIn(slug) | SessionEvent::Reconnected(slug) => {
+                let slug = *slug;
+                if let Some(id) = this
+                    .id
+                    .clone()
+                    .filter(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
                     this.clear();
                     this.open(&id, cx);
                 }
             }
-            SessionEvent::SignedOut => {
-                this.clear();
-                cx.notify();
+            SessionEvent::SignedOut(slug) => {
+                let slug = *slug;
+                if this
+                    .id
+                    .as_deref()
+                    .is_some_and(|id| this.session.read(cx).slug_for(id) == Some(slug))
+                {
+                    this.clear();
+                    cx.notify();
+                }
             }
-            SessionEvent::Reconnected | SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
+            SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
         })
         .detach();
 
@@ -427,4 +500,14 @@ fn now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+fn streaming_clients(session: &Session) -> Vec<Arc<dyn music::MusicApi>> {
+    let local = session.local_slug();
+    session
+        .active_slugs()
+        .into_iter()
+        .filter(|slug| *slug != local)
+        .filter_map(|slug| session.client_of(Shelf::Account(slug)))
+        .collect()
 }

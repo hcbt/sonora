@@ -221,7 +221,7 @@ fn metadata(track: &Track, cover: Option<&str>, cx: &App) -> Metadata {
         let url = Sonora::global(cx)
             .session
             .read(cx)
-            .client_of(Shelf::of(id))
+            .client_for(id)
             .and_then(|client| client.share_url(MediaKind::Track, id));
         metadata.set_url(url);
     }

@@ -135,7 +135,6 @@ pub fn rhythm(path: &Path) -> TrackRhythm {
     }
 }
 
-/// A timed `SYLT` frame wins over the lyrics text, which is timed only when it parses as LRC.
 /// A timed `SYLT` frame wins over the lyrics text, which is timed when it parses as TTML or LRC.
 pub fn lyrics(path: &Path) -> Result<Option<Lyrics>> {
     if let Some(lines) = synchronized(path) {

@@ -828,6 +828,10 @@ pub struct Capabilities {
     pub radio: bool,
     /// Tracks carry a play count worth a column of its own.
     pub playcounts: bool,
+    /// The listener has a library apart from their favorites, which a track or an album can be
+    /// put into and taken out of through `set_in_library`. Off where the library is the
+    /// favorites, as on Spotify, and where it is fixed, as on a self-hosted server.
+    pub library: bool,
     /// The provider keeps sidebar pins of its own, listed by `pin_targets` and changed
     /// through `set_pinned`. Off, a pin lives in Sonora's settings alone.
     pub pins: bool,
@@ -858,6 +862,7 @@ impl Capabilities {
         follow_artists: true,
         radio: true,
         playcounts: true,
+        library: false,
         pins: false,
         transcode: false,
         playlist_covers: false,
@@ -872,6 +877,7 @@ impl Capabilities {
         follow_artists: false,
         radio: false,
         playcounts: false,
+        library: false,
         pins: false,
         transcode: false,
         playlist_covers: false,

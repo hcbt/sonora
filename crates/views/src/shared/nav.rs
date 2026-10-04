@@ -12,9 +12,19 @@ pub(crate) fn nav_row(
     tint: Hsla,
     accent: Hsla,
 ) -> Button {
+    named_row(id, i18n::lookup(key, None), tint, accent)
+}
+
+/// The same row for a label that is not a translation key, such as a provider's own name.
+pub(crate) fn named_row(
+    id: impl Into<ElementId>,
+    label: impl Into<gpui::SharedString>,
+    tint: Hsla,
+    accent: Hsla,
+) -> Button {
     Button::new(id)
         .ghost()
-        .label(i18n::lookup(key, None))
+        .label(label)
         .tint(tint)
         .gap_2p5()
         .justify_start()

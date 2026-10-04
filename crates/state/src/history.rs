@@ -1,15 +1,16 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use gpui::{App, Context, Entity, Task};
-use music::{ArtistRef, Track};
+use music::{ArtistRef, MusicApi, Track};
 use rusqlite::types::Value;
 use rusqlite::{Connection, params, params_from_iter};
 use storage::Database;
 
 use crate::playback::PlaybackEvent;
-use crate::{Io, Outcome, Playback, Session, SessionEvent, SessionState, Toast, Toasts, join};
+use crate::{Io, Outcome, Playback, Session, SessionEvent, Shelf, Toast, Toasts, join};
 
 const LOCAL_LIMIT: usize = 500;
 /// Every column of `plays`, in the order a [`Row`] holds them.
@@ -171,16 +172,20 @@ impl Store {
     }
 
     fn load(&self, scope: &str) -> Result<Vec<Track>> {
+        self.read("scope = ?", scope)
+    }
+
+    fn read(&self, predicate: &str, scope: &str) -> Result<Vec<Track>> {
         let connection = self.open()?;
         let mut query = connection
-            .prepare(
+            .prepare(&format!(
                 "SELECT track_id, played_at, name, playable, artists, artist_refs, album,
                         album_id, cover, duration_ms, explicit
                  FROM plays
-                 WHERE scope = ?
+                 WHERE {predicate}
                  ORDER BY played_at DESC
-                 LIMIT ?",
-            )
+                 LIMIT ?"
+            ))
             .context("cannot prepare listening history read")?;
         let rows = query
             .query_map(params![scope, LOCAL_LIMIT as i64], |row| {
@@ -270,8 +275,8 @@ impl History {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn | SessionEvent::Reconnected => this.refresh(cx),
-            SessionEvent::SignedOut => this.reset(cx),
+            SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) => this.refresh(cx),
+            SessionEvent::SignedOut(_) => this.refresh(cx),
             SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
         })
         .detach();
@@ -506,13 +511,27 @@ impl History {
         if self.task.is_some() {
             return;
         }
-        let Some(scope) = self.scope(cx) else {
-            return self.reset(cx);
+        let scopes: Vec<String> = {
+            let session = self.session.read(cx);
+            session
+                .libraries()
+                .into_iter()
+                .filter_map(|(slug, _)| session.account_scope(slug))
+                .collect()
         };
+        if scopes.is_empty() {
+            return self.reset(cx);
+        }
         let store = self.store.clone();
         let io = self.io.clone();
-        // The provider's own cross-device recently played folds in here.
-        let client = self.session.read(cx).client();
+        let clients: Vec<Arc<dyn MusicApi>> = {
+            let session = self.session.read(cx);
+            session
+                .libraries()
+                .into_iter()
+                .filter_map(|(slug, _)| session.client_of(Shelf::Account(slug)))
+                .collect()
+        };
         // A refresh with something to show must not blank the list back to a skeleton.
         if self.tracks.is_empty() {
             self.state = HistoryState::Loading;
@@ -521,13 +540,23 @@ impl History {
 
         self.task = Some(cx.spawn(async move |this, cx| {
             let loaded = join(io.spawn(async move {
-                tokio::task::spawn_blocking(move || store.load(&scope)).await?
+                let mut tracks = Vec::new();
+                for scope in scopes {
+                    let store = store.clone();
+                    tracks.extend(tokio::task::spawn_blocking(move || store.load(&scope)).await??);
+                }
+                Ok::<_, anyhow::Error>(tracks)
             }))
             .await;
-            let recent = match client {
-                Some(client) => join(io.spawn(async move { client.recently_played().await })).await,
-                None => Ok(Vec::new()),
-            };
+            let mut recent = Vec::new();
+            for client in clients {
+                if let Ok(played) =
+                    join(io.spawn(async move { client.recently_played().await })).await
+                {
+                    recent.extend(played);
+                }
+            }
+            let recent = Ok(recent);
             this.update(cx, |this, cx| {
                 this.task = None;
                 match loaded {
@@ -553,9 +582,6 @@ impl History {
     }
 
     fn record(&mut self, cx: &mut Context<Self>) {
-        let Some(scope) = self.scope(cx) else {
-            return;
-        };
         let Some(mut track) = self.playback.read(cx).track().cloned() else {
             return;
         };
@@ -563,6 +589,9 @@ impl History {
             return;
         };
         let Some(provider) = self.session.read(cx).slug_for(&track_id) else {
+            return;
+        };
+        let Some(scope) = self.session.read(cx).account_scope(provider) else {
             return;
         };
         let key = (provider.to_owned(), track_id.clone());
@@ -604,7 +633,7 @@ impl History {
         if music::is_local_id(track_id) {
             return;
         }
-        let Some(client) = self.session.read(cx).client() else {
+        let Some(client) = self.session.read(cx).client_for(track_id) else {
             return;
         };
         let track_id = track_id.to_owned();
@@ -617,11 +646,8 @@ impl History {
 
     fn scope(&self, cx: &Context<Self>) -> Option<String> {
         let session = self.session.read(cx);
-        let SessionState::SignedIn(profile) = session.state() else {
-            return None;
-        };
-        let provider = session.provider_slug()?;
-        Some(format!("{provider}:{}", profile.id))
+        let slug = session.libraries().into_iter().next()?.0;
+        session.account_scope(slug)
     }
 
     fn reset(&mut self, cx: &mut Context<Self>) {

@@ -609,7 +609,7 @@ impl Listening {
         let ours = session.provider_slug() == Some(provider.as_str());
         let gone = !session.is_pending() && (!ours || session.client().is_none());
         match event {
-            SessionEvent::SignedIn | SessionEvent::Reconnected if ours => self.catch_up(cx),
+            SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) if ours => self.catch_up(cx),
             _ if gone => self.leave(cx),
             _ => {}
         }

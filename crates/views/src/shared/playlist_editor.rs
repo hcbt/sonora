@@ -191,10 +191,9 @@ impl PlaylistEditor {
     /// where the provider takes a cover.
     fn details(&self, playlist: &Playlist, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = *cx.theme();
-        let covers = Sonora::global(cx)
-            .session
-            .read(cx)
-            .capabilities_of(Shelf::of(&playlist.id))
+        let session = Sonora::global(cx).session.read(cx);
+        let covers = session
+            .capabilities_of(session.shelf_of(&playlist.id))
             .playlist_covers;
         let removable = self.cover != CoverEdit::Remove;
         div()

@@ -17,7 +17,7 @@ use music::{Contributor, Shape, Track, Voice};
 use router::{Destination, LibraryTab, Link as _};
 use state::{
     AppSettings, Lyrics, LyricsState, Network, Playback, PlaybackState, Queue, QueuePosition,
-    QueueSections as Sections, QueueSlot as Slot, QueueView, RomanizationScripts, Shelf, SideTab,
+    QueueSections as Sections, QueueSlot as Slot, QueueView, RomanizationScripts, SideTab,
     Sonora, Whence,
 };
 use ui::{
@@ -882,7 +882,17 @@ impl Aside {
                         .gap_1()
                         // Only where a station exists to keep the queue going.
                         .when(
-                            Sonora::global(cx).session.read(cx).capabilities().radio,
+                            self.playback
+                                .read(cx)
+                                .track()
+                                .and_then(|track| track.id.as_deref())
+                                .is_some_and(|id| {
+                                    Sonora::global(cx)
+                                        .session
+                                        .read(cx)
+                                        .capabilities_for(id)
+                                        .radio
+                                }),
                             |this| {
                                 this.child(
                                     Button::new("toggle-radio")
@@ -1909,19 +1919,38 @@ impl Aside {
         cx: &App,
     ) -> Option<(SharedString, Destination)> {
         let id = SharedString::from(origin.id.clone());
+        let track_id = self
+            .playback
+            .read(cx)
+            .track()
+            .and_then(|track| track.id.clone());
         let place = match origin.whence {
             Whence::Album => Destination::Album(id),
             Whence::Playlist => Destination::Playlist(id),
             Whence::Artist => Destination::Artist(id),
             Whence::Radio => Destination::Song(id),
-            Whence::Saved => Destination::Library(LibraryTab::Songs),
+            Whence::Saved => {
+                let account = track_id
+                    .as_deref()
+                    .filter(|id| !music::is_local_id(id))
+                    .and_then(|id| Sonora::global(cx).session.read(cx).slug_for(id))?;
+                Destination::Library {
+                    account: account.into(),
+                    tab: LibraryTab::Songs,
+                }
+            }
             Whence::Local => Destination::Local(LibraryTab::Songs),
         };
         let name = match origin.whence {
-            Whence::Saved => match Sonora::global(cx).library.read(cx).shape(Shelf::Streaming) {
-                Shape::Saved => t!("library-liked-songs"),
-                Shape::Catalog(_) => t!("nav-songs"),
-            },
+            Whence::Saved => {
+                let shelf = track_id
+                    .as_deref()
+                    .and_then(|id| Sonora::global(cx).session.read(cx).shelf_for(id))?;
+                match Sonora::global(cx).library.read(cx).shape(shelf) {
+                    Shape::Saved => t!("library-liked-songs"),
+                    Shape::Catalog(_) => t!("nav-songs"),
+                }
+            }
             Whence::Local => t!("nav-local"),
             Whence::Radio => t!("queue-from-radio", name = origin.name.as_deref()?),
             Whence::Album | Whence::Playlist | Whence::Artist => origin.name.clone()?,

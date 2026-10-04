@@ -130,6 +130,7 @@ fn session(client: AppleClient, profile: crate::UserProfile) -> ProviderSession 
         capabilities: Capabilities {
             radio: true,
             follow_artists: true,
+            library: true,
             pins: true,
             keeps: true,
             downloads: true,

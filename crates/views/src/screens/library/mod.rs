@@ -91,10 +91,10 @@ impl Section {
     /// stay so stored layouts survive.
     fn key(self, shelf: Shelf) -> &'static str {
         match (shelf, self) {
-            (Shelf::Streaming, Section::Songs) => "songs",
-            (Shelf::Streaming, Section::Albums) => "albums",
-            (Shelf::Streaming, Section::Playlists) => "playlists",
-            (Shelf::Streaming, Section::Artists) => "artists",
+            (Shelf::Account(_), Section::Songs) => "songs",
+            (Shelf::Account(_), Section::Albums) => "albums",
+            (Shelf::Account(_), Section::Playlists) => "playlists",
+            (Shelf::Account(_), Section::Artists) => "artists",
             (Shelf::Local, Section::Songs) => "local-songs",
             (Shelf::Local, Section::Albums) => "local-albums",
             (Shelf::Local, Section::Playlists) => "local-playlists",
@@ -128,13 +128,13 @@ impl Section {
             (Shelf::Local, _, Section::Albums) => "library-no-local-albums",
             (Shelf::Local, _, Section::Playlists) => "library-no-local-playlists",
             (Shelf::Local, _, Section::Artists) => "library-no-local-artists",
-            (Shelf::Streaming, Shape::Saved, Section::Songs) => "library-no-songs",
-            (Shelf::Streaming, Shape::Saved, Section::Albums) => "library-no-albums",
-            (Shelf::Streaming, Shape::Saved, Section::Artists) => "library-no-artists",
-            (Shelf::Streaming, Shape::Catalog(_), Section::Songs) => "library-no-catalog-songs",
-            (Shelf::Streaming, Shape::Catalog(_), Section::Albums) => "library-no-catalog-albums",
-            (Shelf::Streaming, Shape::Catalog(_), Section::Artists) => "library-no-catalog-artists",
-            (Shelf::Streaming, _, Section::Playlists) => "library-no-playlists",
+            (Shelf::Account(_), Shape::Saved, Section::Songs) => "library-no-songs",
+            (Shelf::Account(_), Shape::Saved, Section::Albums) => "library-no-albums",
+            (Shelf::Account(_), Shape::Saved, Section::Artists) => "library-no-artists",
+            (Shelf::Account(_), Shape::Catalog(_), Section::Songs) => "library-no-catalog-songs",
+            (Shelf::Account(_), Shape::Catalog(_), Section::Albums) => "library-no-catalog-albums",
+            (Shelf::Account(_), Shape::Catalog(_), Section::Artists) => "library-no-catalog-artists",
+            (Shelf::Account(_), _, Section::Playlists) => "library-no-playlists",
         }
     }
 
@@ -160,7 +160,7 @@ impl Section {
 
 fn origin(shelf: Shelf) -> Origin {
     match shelf {
-        Shelf::Streaming => Origin::saved(),
+        Shelf::Account(_) => Origin::saved(),
         Shelf::Local => Origin::local(),
     }
 }
@@ -219,10 +219,9 @@ impl LibraryView {
         shelf: Shelf,
         library: Entity<Library>,
         playback: Entity<Playback>,
-        window: &mut Window,
+        width: Pixels,
         cx: &mut Context<Self>,
     ) -> Self {
-        let width = cells::content_width(window, Pixels::ZERO, cx);
         let settings = Sonora::global(cx).settings.clone();
         let stored = |section: Section, cx: &App| {
             let settings = settings.read(cx);
@@ -655,19 +654,27 @@ impl LibraryView {
         if !duration.is_zero() {
             strip = strip.text(runtime(duration));
         }
-        let (title, icon, eyebrow) = match (self.shape(cx), self.shelf) {
-            (Shape::Catalog(_), Shelf::Local) => {
-                (t!("nav-songs"), LibraryTab::Songs.icon(), t!("nav-local"))
-            }
-            (Shape::Catalog(_), Shelf::Streaming) => {
-                (t!("nav-songs"), LibraryTab::Songs.icon(), t!("nav-library"))
-            }
-            (Shape::Saved, _) => (
-                t!("library-liked-songs"),
-                "icons/heart-filled.svg",
-                t!("detail-playlist"),
-            ),
-        };
+        let (title, icon, eyebrow): (SharedString, &str, SharedString) =
+            match (self.shape(cx), self.shelf) {
+                (Shape::Catalog(_), Shelf::Local) => {
+                    (t!("nav-songs"), LibraryTab::Songs.icon(), t!("nav-local"))
+                }
+                (Shape::Catalog(_), Shelf::Account(slug)) => (
+                    t!("nav-songs"),
+                    LibraryTab::Songs.icon(),
+                    Sonora::global(cx)
+                        .session
+                        .read(cx)
+                        .name_of(slug)
+                        .unwrap_or(slug)
+                        .into(),
+                ),
+                (Shape::Saved, _) => (
+                    t!("library-liked-songs"),
+                    "icons/heart-filled.svg",
+                    t!("detail-playlist"),
+                ),
+            };
 
         PageHero::new("library-hero", title)
             .fallback(icon)

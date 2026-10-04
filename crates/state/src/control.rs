@@ -375,7 +375,15 @@ impl Control {
             playlists: playlists.unwrap_or_default(),
             artists: artists.unwrap_or_default(),
         };
-        let library = self.library.read(cx).state(Shelf::Streaming);
+        let shelf = self
+            .session
+            .read(cx)
+            .libraries()
+            .into_iter()
+            .next()
+            .map(|(slug, _)| Shelf::Account(slug))
+            .unwrap_or(Shelf::Local);
+        let library = self.library.read(cx).state(shelf);
         let ranked = search::rank(
             library.tracks(),
             library.albums(),
@@ -711,7 +719,7 @@ fn current(playback: &Playback, cx: &App) -> Option<Current> {
     };
     let sonora = Sonora::global(cx);
     let id = track.id.as_deref();
-    let provider = match id.is_some_and(|id| Shelf::of(id).local()) {
+    let provider = match id.is_some_and(music::is_local_id) {
         true => Some(LOCAL.to_owned()),
         false => sonora.session.read(cx).provider_slug().map(str::to_owned),
     };

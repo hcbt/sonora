@@ -49,6 +49,15 @@ use layout::section_title;
 pub(crate) use layout::{Layout, frame};
 pub(crate) use rows::Row;
 
+/// The prompt a sign-in raised. Adding another account leaves the others signed in, so the
+/// dialog also reads `prompt` when the session state is no longer `Authorizing`.
+fn sign_in_prompt(session: &Session) -> Option<SignInPrompt> {
+    match session.state() {
+        SessionState::Authorizing(Some(prompt)) => Some(prompt.clone()),
+        _ => session.prompt(),
+    }
+}
+
 /// The space between two groups of a page.
 pub(super) const GROUPS: Pixels = px(40.);
 /// How much a query found in a setting's title counts over one found in its detail.
@@ -1365,10 +1374,9 @@ impl Render for SettingsView {
             self.typefaces.sync(false, None, window, cx);
         }
 
-        let accounts = match self.session.read(cx).state() {
-            SessionState::Authorizing(Some(SignInPrompt::Accounts(accounts))) => {
-                Some(accounts.clone())
-            }
+        let prompt = sign_in_prompt(self.session.read(cx));
+        let accounts = match &prompt {
+            Some(SignInPrompt::Accounts(accounts)) => Some(accounts.clone()),
             _ => None,
         };
         let code = match self.session.read(cx).state() {
@@ -1381,12 +1389,9 @@ impl Render for SettingsView {
             self.sign_in_running = false;
             self.sign_in_for = None;
         }
-        let manual_secret = self.manual_secret.filter(|_| {
-            matches!(
-                self.session.read(cx).state(),
-                SessionState::Authorizing(Some(SignInPrompt::Secret))
-            )
-        });
+        let manual_secret = self
+            .manual_secret
+            .filter(|_| matches!(prompt, Some(SignInPrompt::Secret)));
 
         // only one of these is ever up: a prompt the sign-in raised hides the choice behind
         // it, and the choice holds the veil until that prompt arrives

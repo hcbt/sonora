@@ -88,10 +88,8 @@ impl Usage {
         cx: &mut Context<Self>,
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedIn => this.connected(cx),
-            SessionEvent::Reconnected
-            | SessionEvent::SignedOut
-            | SessionEvent::WentOffline
+            SessionEvent::SignedIn(_) => this.connected(cx),
+            SessionEvent::Reconnected(_) | SessionEvent::SignedOut(_) | SessionEvent::WentOffline
             | SessionEvent::LocalChanged => {}
         })
         .detach();

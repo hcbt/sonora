@@ -20,6 +20,7 @@ mod mosaic;
 mod network;
 mod outputs;
 mod overload;
+mod owned;
 mod pins;
 mod playback;
 mod potoken;
@@ -293,7 +294,7 @@ pub fn init(
     // A toast can carry an Undo that acts on the account it was shown for, so no such toast
     // outlives it. A plain one stays, since the sign-out can be what it explains.
     cx.subscribe(&session, |_, event, cx| {
-        if let SessionEvent::SignedOut = event {
+        if let SessionEvent::SignedOut(_) = event {
             Toasts::clear_account(cx);
         }
     })

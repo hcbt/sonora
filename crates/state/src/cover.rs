@@ -1,8 +1,7 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use gpui::{Context, Entity, Task};
-use music::{CoverSize, MusicApi};
+use music::CoverSize;
 
 use crate::{Io, Playback, Session, SessionEvent, join};
 
@@ -34,10 +33,10 @@ impl Cover {
     ) -> Self {
         cx.observe(&playback, |this, _, cx| this.follow(cx))
             .detach();
-        cx.subscribe(&session, |this, _, event, cx| match event {
-            SessionEvent::SignedOut => this.forget(cx),
-            SessionEvent::SignedIn
-            | SessionEvent::Reconnected
+        cx.subscribe(&session, |this, _session, event, cx| match event {
+            SessionEvent::SignedOut(slug) => this.forget(slug, cx),
+            SessionEvent::SignedIn(_)
+            | SessionEvent::Reconnected(_)
             | SessionEvent::WentOffline
             | SessionEvent::LocalChanged => {}
         })
@@ -74,12 +73,23 @@ impl Cover {
             .filter(|_| self.album.as_deref() == Some(album))
     }
 
-    fn forget(&mut self, cx: &mut Context<Self>) {
+    fn forget(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let current = self
+            .album
+            .as_deref()
+            .is_some_and(|id| self.session.read(cx).slug_for(id) == Some(slug));
+        self.cache
+            .retain(|id, _| self.session.read(cx).slug_for(id) != Some(slug));
+        if !current {
+            if self.large.as_deref().is_some() {
+                cx.notify();
+            }
+            return;
+        }
         self.task = None;
         self.album = None;
         self.large = None;
         self.full = None;
-        self.cache.clear();
         cx.notify();
     }
 
@@ -96,7 +106,9 @@ impl Cover {
         self.task = None;
         self.album = album.clone();
         let cached = album.as_ref().and_then(|id| self.cache.get(id)).cloned();
-        let client = album.as_deref().and_then(|id| self.client(id, cx));
+        let client = album
+            .as_deref()
+            .and_then(|id| self.session.read(cx).client_for(id));
         let derive = |size| client.as_ref()?.cover_at(thumbnail.as_deref()?, size);
         self.large = cached
             .as_ref()
@@ -117,7 +129,7 @@ impl Cover {
     }
 
     fn load(&mut self, id: String, cx: &mut Context<Self>) {
-        let Some(client) = self.client(&id, cx) else {
+        let Some(client) = self.session.read(cx).client_for(&id) else {
             return;
         };
 
@@ -156,15 +168,5 @@ impl Cover {
             })
             .ok();
         }));
-    }
-
-    /// The client that serves album `id`: the local library for a local id, the signed-in
-    /// provider otherwise.
-    fn client(&self, id: &str, cx: &Context<Self>) -> Option<Arc<dyn MusicApi>> {
-        let session = self.session.read(cx);
-        match music::is_local_id(id) {
-            true => session.local_client(),
-            false => session.client(),
-        }
     }
 }

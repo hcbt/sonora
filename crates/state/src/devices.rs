@@ -95,9 +95,9 @@ impl Devices {
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
             SessionEvent::LocalChanged => {}
-            SessionEvent::SignedIn
-            | SessionEvent::SignedOut
-            | SessionEvent::Reconnected
+            SessionEvent::SignedIn(_)
+            | SessionEvent::SignedOut(_)
+            | SessionEvent::Reconnected(_)
             | SessionEvent::WentOffline => this.relink(cx),
         })
         .detach();
@@ -419,7 +419,7 @@ impl Devices {
         let link = self
             .session
             .read(cx)
-            .client()
+            .connect_client()
             .and_then(|client| client.connect());
         let same = match (&self.link, &link) {
             (Some(old), Some(new)) => Arc::ptr_eq(old, new),
@@ -677,7 +677,7 @@ impl Devices {
         if self.listing.is_some() {
             return;
         }
-        let Some(client) = self.session.read(cx).client() else {
+        let Some(client) = self.session.read(cx).connect_client() else {
             return;
         };
         let Some(remote) = self.roster.elsewhere.as_ref() else {
@@ -803,7 +803,7 @@ impl Devices {
     }
 
     fn enqueue(&mut self, id: String, added_by: Option<String>, cx: &mut Context<Self>) {
-        let Some(client) = self.session.read(cx).client() else {
+        let Some(client) = self.session.read(cx).connect_client() else {
             return;
         };
         let key = id.clone();
@@ -841,7 +841,7 @@ impl Devices {
         if self.library.read(cx).saved(&id) {
             return;
         }
-        let Some(client) = self.session.read(cx).client() else {
+        let Some(client) = self.session.read(cx).connect_client() else {
             return;
         };
         let slot = id.clone();
@@ -917,7 +917,7 @@ impl Devices {
     /// here while it loaded: a handover gives way to any change, and an edit to one that moved the
     /// songs the report showed. Songs already in the queue are not read from the provider again.
     fn start(&mut self, start: Start, cx: &mut Context<Self>) {
-        let Some(client) = self.session.read(cx).client() else {
+        let Some(client) = self.session.read(cx).connect_client() else {
             return;
         };
         let state = start.state.clone();
