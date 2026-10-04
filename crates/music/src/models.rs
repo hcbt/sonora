@@ -74,6 +74,47 @@ pub struct Track {
     pub tags: Vec<String>,
     pub languages: Vec<String>,
     pub credits: Vec<Credit>,
+    /// Tempo and key, when a provider has them. Absent rather than an empty struct, so a
+    /// track list does not carry the analysis for songs that have none.
+    pub rhythm: Option<Box<TrackRhythm>>,
+}
+
+/// Tempo and key a provider reports for one track. A missing field is unknown, not a zero
+/// tempo or an empty key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackRhythm {
+    pub bpm: Option<u32>,
+    /// An analysed key. A file that only stored a string leaves this empty and sets `written`.
+    pub key: Option<MusicalKey>,
+    /// A key a file already wrote, shown as stored when `key` is absent.
+    pub written: Option<String>,
+}
+
+/// Pitch, mode and Camelot code from an analysis. `pitch` is the provider's spelling, such as
+/// `F#`, before the view turns it into notation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MusicalKey {
+    pub pitch: String,
+    pub mode: KeyMode,
+    pub camelot: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyMode {
+    #[default]
+    Unknown,
+    Minor,
+    Major,
+}
+
+impl TrackRhythm {
+    /// `None` when nothing was found, so a track list does not box an empty analysis.
+    pub fn packed(self) -> Option<Box<Self>> {
+        let known = self.bpm.is_some()
+            || self.key.is_some()
+            || self.written.as_ref().is_some_and(|key| !key.is_empty());
+        known.then(|| Box::new(self))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

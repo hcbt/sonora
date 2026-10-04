@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use moka::{future::Cache, sync::Cache as SyncCache};
 use music::{
     AlbumCatalogue, AlbumDetail, Artist, ArtistCatalogue, ArtistProfile, GenreDetail, MusicApi,
-    PlaylistDetail, Track,
+    PlaylistDetail, Track, TrackRhythm,
 };
 
 const ARTISTS: usize = 32;
@@ -29,6 +29,9 @@ trait CatalogBackend: Send + Sync {
     async fn artist_images(&self, ids: Vec<String>) -> Result<HashMap<String, String>>;
     async fn track(&self, id: &str) -> Result<Track>;
     async fn track_playcount(&self, id: &str) -> Result<Option<u64>>;
+    async fn track_rhythm(&self, _id: &str) -> Result<TrackRhythm> {
+        Ok(TrackRhythm::default())
+    }
     async fn album(&self, id: &str) -> Result<AlbumDetail>;
     async fn album_catalogue(
         &self,
@@ -66,6 +69,9 @@ impl CatalogBackend for ApiBackend {
     }
     async fn track_playcount(&self, id: &str) -> Result<Option<u64>> {
         self.0.track_playcount(id).await
+    }
+    async fn track_rhythm(&self, id: &str) -> Result<TrackRhythm> {
+        self.0.track_rhythm(id).await
     }
     async fn album(&self, id: &str) -> Result<AlbumDetail> {
         self.0.album(id).await
@@ -139,6 +145,7 @@ pub(crate) struct SongPage {
     pub(crate) artist: Option<Arc<ArtistProfile>>,
     pub(crate) portraits: HashMap<String, String>,
     pub(crate) playcount: Option<u64>,
+    pub(crate) rhythm: TrackRhythm,
 }
 
 pub(crate) struct CatalogSource {
@@ -316,7 +323,17 @@ impl CatalogSource {
                             .unwrap_or_default(),
                     }
                 };
-                let (album, artist, mut portraits) = tokio::join!(album, artist, portraits);
+                let rhythm = async {
+                    match self.backend.track_rhythm(id).await {
+                        Ok(rhythm) => rhythm,
+                        Err(error) => {
+                            log::warn!("song: cannot read tempo and key: {error:#}");
+                            TrackRhythm::default()
+                        }
+                    }
+                };
+                let (album, artist, mut portraits, rhythm) =
+                    tokio::join!(album, artist, portraits, rhythm);
                 if let (Some(id), Some(cover)) = (
                     primary_artist,
                     artist
@@ -348,6 +365,7 @@ impl CatalogSource {
                     artist,
                     portraits,
                     playcount,
+                    rhythm,
                 })
             })
             .await
@@ -435,6 +453,7 @@ mod tests {
                 tags: Vec::new(),
                 languages: Vec::new(),
                 credits: Vec::new(),
+                rhythm: None,
             }
         }
 

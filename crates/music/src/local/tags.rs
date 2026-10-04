@@ -15,7 +15,7 @@ use lofty::tag::{ItemValue, Tag, TagItem};
 
 use crate::engine::Loudness;
 use crate::lyrics::lrc;
-use crate::{Lyrics, LyricsLine, LyricsWord, TrackTags, Voice};
+use crate::{Lyrics, LyricsLine, LyricsWord, TrackRhythm, TrackTags, Voice};
 
 use super::wire;
 
@@ -75,6 +75,35 @@ pub fn loudness(path: &Path) -> Option<Loudness> {
             .and_then(|peak| peak.trim().parse().ok());
         Some(Loudness::replay_gain(gain, peak))
     })
+}
+
+/// Tempo and key a file tagged itself with. An untagged file, or one that will not open, is
+/// empty rather than an error: the song page still has the rest of the track.
+pub fn rhythm(path: &Path) -> TrackRhythm {
+    let Ok(tagged) = Probe::open(path).and_then(|probe| {
+        probe
+            .options(ParseOptions::new().read_cover_art(false))
+            .read()
+    }) else {
+        return TrackRhythm::default();
+    };
+    let Some(tag) = tagged.primary_tag().or_else(|| tagged.first_tag()) else {
+        return TrackRhythm::default();
+    };
+    let bpm = tag
+        .get_string(ItemKey::IntegerBpm)
+        .or_else(|| tag.get_string(ItemKey::Bpm))
+        .and_then(bpm_value);
+    let written = tag
+        .get_string(ItemKey::InitialKey)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+        .map(str::to_owned);
+    TrackRhythm {
+        bpm,
+        key: None,
+        written,
+    }
 }
 
 /// A timed `SYLT` frame wins over the lyrics text, which is timed only when it parses as LRC.
@@ -324,6 +353,18 @@ fn decibels(value: &str) -> Option<f32> {
         .trim()
         .parse()
         .ok()
+}
+
+/// A tempo tag such as `128`, `127.6` or `128 BPM`, rounded the way Spotify rounds its analysis.
+fn bpm_value(value: &str) -> Option<u32> {
+    let number: String = value
+        .trim()
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    let parsed: f64 = number.parse().ok()?;
+    (parsed.is_finite() && parsed > 0. && parsed <= 999.).then(|| parsed.round() as u32)
 }
 
 fn number(value: Option<u32>) -> String {

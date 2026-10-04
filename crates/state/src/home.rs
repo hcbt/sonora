@@ -518,6 +518,7 @@ mod tests {
             tags: Vec::new(),
             languages: Vec::new(),
             credits: Vec::new(),
+            rhythm: None,
         }
     }
 

@@ -44,10 +44,10 @@ use time::{Month, OffsetDateTime};
 pub use equalizer::Equalizer;
 pub use models::{
     Album, AlbumCatalogue, AlbumDetail, Artist, ArtistCatalogue, ArtistProfile, ArtistRef,
-    Contributor, Credit, Genre, GenreDetail, GenreItem, GenreSection, HomeFeed, Lyrics, LyricsHit,
-    LyricsLane, LyricsLine, LyricsQuery, LyricsWord, PinOutcome, PinTarget, PinTargetKind,
-    Playlist, PlaylistDetail, ReleaseType, RomanizedText, SavedArtist, Track, TrackKey, TrackTags,
-    UserDetail, UserProfile, Voice, WritingSystem,
+    Contributor, Credit, Genre, GenreDetail, GenreItem, GenreSection, HomeFeed, KeyMode, Lyrics,
+    LyricsHit, LyricsLane, LyricsLine, LyricsQuery, LyricsWord, MusicalKey, PinOutcome, PinTarget,
+    PinTargetKind, Playlist, PlaylistDetail, ReleaseType, RomanizedText, SavedArtist, Track,
+    TrackKey, TrackRhythm, TrackTags, UserDetail, UserProfile, Voice, WritingSystem,
 };
 pub use spectrum::Spectrum;
 
@@ -164,6 +164,12 @@ pub trait MusicApi: Send + Sync {
         anyhow::bail!("this provider does not support file deletion")
     }
     async fn track_playcount(&self, track_id: &str) -> Result<Option<u64>>;
+
+    /// Tempo and key, when the provider has them. An empty answer means it does not, not that
+    /// the request failed. Spotify reads the same analysis its own client shows as BPM and key.
+    async fn track_rhythm(&self, _track_id: &str) -> Result<TrackRhythm> {
+        Ok(TrackRhythm::default())
+    }
 
     /// Tells the provider's own server whether a track is playing and where it is. It is sent on
     /// every start, pause, seek and stop, and never counts as a listen. A provider that keeps no

@@ -129,6 +129,7 @@ fn hydrate(stub: Stub) -> Track {
         tags: Vec::new(),
         languages: Vec::new(),
         credits: Vec::new(),
+        rhythm: None,
     }
 }
 
@@ -915,6 +916,7 @@ mod tests {
             tags: Vec::new(),
             languages: Vec::new(),
             credits: Vec::new(),
+            rhythm: None,
         }
     }
 

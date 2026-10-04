@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use gpui::{Context, Entity, Task};
-use music::{AlbumDetail, ArtistProfile, Track};
+use music::{AlbumDetail, ArtistProfile, Track, TrackRhythm};
 use tokio::task::AbortHandle;
 
 use crate::catalog::SongPage;
@@ -74,6 +74,12 @@ impl SongDetail {
     }
     pub fn playcount(&self) -> Option<u64> {
         self.page.as_ref().and_then(|page| page.playcount)
+    }
+    pub fn rhythm(&self) -> TrackRhythm {
+        self.page
+            .as_ref()
+            .map(|page| page.rhythm.clone())
+            .unwrap_or_default()
     }
     pub fn is_loading(&self) -> bool {
         self.loading

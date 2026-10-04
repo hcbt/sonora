@@ -8,7 +8,7 @@ use gpui::{
     Window, div, px, svg,
 };
 use i18n::t;
-use music::{ArtistRef, Contributor};
+use music::{ArtistRef, Contributor, KeyMode, TrackRhythm};
 use router::{Destination, Link as _, navigate};
 use state::Playback;
 use ui::{
@@ -304,6 +304,42 @@ pub(crate) fn length<F>(cell: &Cell<F>, value: Duration, muted: Hsla) -> AnyElem
         .font_features(tabular())
         .child(clock(value))
         .into_any_element()
+}
+
+/// The key Spotify shows: pitch and mode, then the Camelot code when the analysis has one.
+/// A file that only stored a string is shown as written.
+pub(crate) fn key_label(rhythm: &TrackRhythm) -> Option<SharedString> {
+    if let Some(key) = &rhythm.key {
+        let pitch = pitch_notation(&key.pitch);
+        let named = match (pitch.is_empty(), key.mode) {
+            (true, _) => None,
+            (false, KeyMode::Minor) => Some(t!("song-key-minor", key = pitch.as_str())),
+            (false, KeyMode::Major) => Some(t!("song-key-major", key = pitch.as_str())),
+            (false, KeyMode::Unknown) => Some(SharedString::from(pitch)),
+        };
+        return match (
+            named,
+            key.camelot.as_deref().filter(|code| !code.is_empty()),
+        ) {
+            (Some(named), Some(camelot)) => Some(t!(
+                "song-key-with-camelot",
+                key = named.as_ref(),
+                camelot = camelot
+            )),
+            (Some(named), None) => Some(named),
+            (None, Some(camelot)) => Some(SharedString::from(camelot.to_owned())),
+            (None, None) => None,
+        };
+    }
+    rhythm
+        .written
+        .as_deref()
+        .filter(|key| !key.is_empty())
+        .map(SharedString::from)
+}
+
+fn pitch_notation(pitch: &str) -> String {
+    pitch.replace('#', "♯").replace('b', "♭")
 }
 
 pub(crate) fn stamp(seconds: Option<i64>) -> SharedString {

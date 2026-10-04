@@ -58,6 +58,7 @@ pub(crate) async fn metadata(session: &Session, uris: &[String]) -> Result<HashM
         let track = track_from(&entity.entity_uri, &message);
         tracks.insert(entity.entity_uri, track);
     }
+    super::attributes::fill(session, &mut tracks).await;
     Ok(tracks)
 }
 
@@ -166,6 +167,7 @@ fn track_from(uri: &str, track: &TrackMessage) -> Track {
                 })
             })
             .collect(),
+        rhythm: None,
     }
 }
 

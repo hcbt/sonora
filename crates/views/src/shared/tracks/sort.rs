@@ -28,6 +28,17 @@ pub(super) fn compare(tracks: &[Track], field: TrackField, a: usize, b: usize) -
             .get(a)
             .map(|track| track.duration)
             .cmp(&tracks.get(b).map(|track| track.duration)),
+        TrackField::Bpm => tracks
+            .get(a)
+            .and_then(|track| track.rhythm.as_ref())
+            .and_then(|rhythm| rhythm.bpm)
+            .cmp(
+                &tracks
+                    .get(b)
+                    .and_then(|track| track.rhythm.as_ref())
+                    .and_then(|rhythm| rhythm.bpm),
+            ),
+        TrackField::Key => folded(key_text),
         TrackField::Index | TrackField::Cover => a.cmp(&b),
     }
 }
@@ -40,6 +51,7 @@ pub(super) fn group(tracks: &[Track], field: TrackField, row: usize) -> Option<S
         TrackField::Artists => Some(initial(&track.artists)),
         TrackField::Album => Some(initial(&track.album)),
         TrackField::AddedBy => Some(initial(contributor(track))),
+        TrackField::Key => Some(initial(key_text(track))),
         _ => None,
     }
 }
@@ -49,6 +61,18 @@ fn contributor(track: &Track) -> &str {
         .added_by
         .as_ref()
         .map(|added| added.name.as_str())
+        .unwrap_or_default()
+}
+
+fn key_text(track: &Track) -> &str {
+    let Some(rhythm) = track.rhythm.as_deref() else {
+        return "";
+    };
+    rhythm
+        .written
+        .as_deref()
+        .or_else(|| rhythm.key.as_ref().and_then(|key| key.camelot.as_deref()))
+        .or_else(|| rhythm.key.as_ref().map(|key| key.pitch.as_str()))
         .unwrap_or_default()
 }
 

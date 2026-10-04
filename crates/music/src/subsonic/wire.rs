@@ -33,6 +33,7 @@ pub fn track(song: Child, cover: Option<String>) -> Track {
         tags: Vec::new(),
         languages: Vec::new(),
         credits: Vec::new(),
+        rhythm: None,
     }
 }
 

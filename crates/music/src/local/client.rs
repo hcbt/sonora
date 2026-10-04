@@ -8,8 +8,8 @@ use storage::Database;
 
 use crate::{
     Album, AlbumCatalogue, AlbumDetail, Artist, ArtistProfile, GenreItem, GenreSection, HomeFeed,
-    MediaKind, MusicApi, Playlist, PlaylistDetail, SUGGESTIONS, SavedArtist, Track, TrackTags,
-    UserProfile, distinct_covers,
+    MediaKind, MusicApi, Playlist, PlaylistDetail, SUGGESTIONS, SavedArtist, Track, TrackRhythm,
+    TrackTags, UserProfile, distinct_covers,
 };
 
 use super::index::Index;
@@ -272,6 +272,11 @@ impl MusicApi for LocalClient {
 
     async fn track_playcount(&self, _track_id: &str) -> Result<Option<u64>> {
         Ok(None)
+    }
+
+    async fn track_rhythm(&self, track_id: &str) -> Result<TrackRhythm> {
+        let path = wire::path_from_track_id(track_id).context("cannot find the file")?;
+        Ok(tags::rhythm(path))
     }
 
     async fn playlists(&self) -> Result<Vec<Playlist>> {
@@ -644,6 +649,7 @@ mod tests {
             tags: Vec::new(),
             languages: Vec::new(),
             credits: Vec::new(),
+            rhythm: None,
         }
     }
 

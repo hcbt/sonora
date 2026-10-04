@@ -8,12 +8,13 @@ use librespot_protocol::playlist4_external::SelectedListContent as RootList;
 use protobuf::Message as _;
 
 use crate::spotify::{
-    albums, artists, collection, collection2, pathfinder, playlists, profiles, radio, search, wire,
+    albums, artists, attributes, collection, collection2, pathfinder, playlists, profiles, radio,
+    search, wire,
 };
 use crate::{
     Album, AlbumCatalogue, AlbumDetail, Artist, ArtistCatalogue, ArtistProfile, Genre, GenreDetail,
     GenreItem, GenreSection, HomeFeed, Playlist, PlaylistDetail, SUGGESTIONS, SavedArtist, Track,
-    UserDetail, UserProfile,
+    TrackRhythm, UserDetail, UserProfile,
 };
 
 const MADE_FOR_YOU: &str = "0JQ5DAt0tbjZptfcdMSKl3";
@@ -113,6 +114,10 @@ impl MusicApi for LibrespotClient {
 
     async fn track_playcount(&self, track_id: &str) -> Result<Option<u64>> {
         pathfinder::track(&self.session, track_id).await
+    }
+
+    async fn track_rhythm(&self, track_id: &str) -> Result<TrackRhythm> {
+        attributes::rhythm(&self.session, track_id).await
     }
 
     async fn saved_albums(&self) -> Result<Vec<Album>> {

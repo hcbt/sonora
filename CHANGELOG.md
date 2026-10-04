@@ -15,6 +15,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Use OS fullscreen in settings to have the fullscreen button do the same.
 - AIFF files in a local library now show up and play, including `.aif` and `.aifc`. Opening one
   from the file manager works too.
+- A song page lists a track's BPM and key when Spotify or the file knows them, including the
+  Camelot code Spotify shows beside the key.
+- Track lists have BPM and Key columns, filled from that same analysis. Turn them on from the
+  column menu.
+
+### Fixed
+
+- Turning on the BPM or Key column keeps it on the track list, including when the songs have no
+  tempo or key yet.
 
 ### Fixed
 

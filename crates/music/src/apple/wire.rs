@@ -175,6 +175,7 @@ pub fn song(value: &Value) -> Option<Track> {
             .unwrap_or_default(),
         languages: Vec::new(),
         credits: Vec::new(),
+        rhythm: None,
     })
 }
 
