@@ -1127,7 +1127,6 @@ impl Render for LibraryView {
         let view = cx.entity().downgrade();
         let section = self.section;
         let note = self.note(cx);
-        let read_only = self.shelf.rekordbox();
         let content = match (self.section, mode) {
             _ if self.rekordbox_error(cx).is_some() => {
                 Vacancy::new(self.rekordbox_error(cx).unwrap_or_default())
@@ -1165,7 +1164,7 @@ impl Render for LibraryView {
             .relative()
             .size_full()
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                if section != Section::Playlists || read_only {
+                if section != Section::Playlists {
                     return;
                 }
                 window.prevent_default();
