@@ -1,8 +1,8 @@
 //! Reads a rekordbox `master.db` into the models the rest of the app already shows.
 //!
-//! The database is opened read-only. Playlists, artists and albums come from the tables
-//! rekordbox itself keeps; nothing here writes a row back. A playlist folder is not a playlist:
-//! its name is prefixed onto the lists inside it, in the order rekordbox shows them.
+//! Playlists, artists and albums come from the tables rekordbox itself keeps. A playlist folder
+//! is not a playlist: its name is prefixed onto the lists inside it, in the order rekordbox
+//! shows them.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -29,6 +29,7 @@ pub struct Catalog {
     pub playlists: Vec<PlaylistEntry>,
 }
 
+#[derive(Clone)]
 pub struct PlaylistEntry {
     pub id: String,
     pub name: String,
@@ -782,7 +783,8 @@ mod tests {
 
     #[test]
     fn rooted_artwork_is_under_share() {
-        let root = std::env::temp_dir().join(format!("sonora-rekordbox-art-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("sonora-rekordbox-art-{}", std::process::id()));
         let image = root.join("share/PIONEER/Artwork/9ed/example/artwork.jpg");
         fs::create_dir_all(image.parent().unwrap()).unwrap();
         fs::write(&image, b"jpg").unwrap();

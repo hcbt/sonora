@@ -1,8 +1,8 @@
 //! A rekordbox collection, read from `master.db` and played from the files it points at.
 //!
 //! This is a library on disk, like local files, not an account. The folder is the one rekordbox
-//! calls its master database directory. Playlists come from that database. Nothing here writes
-//! back to it.
+//! calls its master database directory. Playlists come from that database, and creating, renaming,
+//! deleting or editing one is written back so rekordbox sees it the next time it opens.
 
 mod cipher;
 mod client;
@@ -10,6 +10,7 @@ mod ids;
 mod playback;
 mod read;
 mod stars;
+mod write;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -31,11 +32,17 @@ pub struct Opened {
 /// `master.db`, or the database file itself.
 pub fn open(folder: &Path) -> Result<Opened> {
     let database_path = master_db(folder)?;
+    write::recover(&database_path);
     let bytes = std::fs::read(&database_path)
         .with_context(|| format!("cannot read {}", database_path.display()))?;
-    let plain = cipher::unlock(&bytes)?;
+    let (plain, seal) = cipher::open(&bytes)?;
     let catalog = read::catalog(&plain, &database_path)?;
-    let api: Arc<dyn MusicApi> = Arc::new(client::Client::new(catalog, Database::standard()));
+    let api: Arc<dyn MusicApi> = Arc::new(client::Client::new(
+        catalog,
+        database_path,
+        seal,
+        Database::standard(),
+    ));
     Ok(Opened {
         api,
         playback: playback::factory(),
@@ -64,7 +71,7 @@ mod tests {
 
     #[test]
     fn reads_an_encrypted_collection() {
-        let plain = cipher::unlock(include_bytes!("fixture.db")).expect("unlock");
+        let (plain, _) = cipher::open(include_bytes!("fixture.db")).expect("unlock");
         let catalog = read::catalog(&plain, Path::new("/tmp")).expect("catalog");
         assert_eq!(catalog.tracks.len(), 1);
         assert_eq!(catalog.tracks[0].name, "She Moves She");
@@ -84,5 +91,4 @@ mod tests {
         assert_eq!(catalog.playlists[0].name, "Sets / Night");
         assert_eq!(catalog.playlists[0].tracks.len(), 1);
     }
-
 }

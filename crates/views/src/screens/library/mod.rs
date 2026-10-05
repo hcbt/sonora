@@ -1248,7 +1248,7 @@ impl Tooled for LibraryView {
         });
 
         let created = self.me.clone();
-        let create = (self.section == Section::Playlists && !self.shelf.rekordbox()).then(|| {
+        let create = (self.section == Section::Playlists).then(|| {
             Button::new("new-playlist")
                 .icon("icons/plus.svg")
                 .tooltip("menu-new-playlist")

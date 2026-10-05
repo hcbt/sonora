@@ -1,12 +1,15 @@
-//! SQLCipher unlock for a rekordbox `master.db`.
+//! SQLCipher for a rekordbox `master.db`.
 //!
 //! Rekordbox 6 and 7 store the collection in a SQLCipher database. The passphrase is the same
 //! for every installation: the program has to open the file on the machine that holds it, and
 //! the key it uses is not tied to a license. A file that is already a plain SQLite database is
 //! returned as it is, so a decrypted copy and an export both open.
+//!
+//! Writing a playlist back uses the same passphrase. [`open`] keeps the derived key so a later
+//! [`Seal::lock`] does not run the key derivation again.
 
 use aes::Aes256;
-use aes::cipher::{Array, BlockCipherDecrypt, KeyInit};
+use aes::cipher::{Array, BlockCipherDecrypt, BlockCipherEncrypt, KeyInit};
 use anyhow::{Result, bail};
 use hmac::Hmac;
 use hmac::digest::block_api::EagerHash;
@@ -62,10 +65,90 @@ impl Params {
     }
 }
 
-/// Returns a plain SQLite image of `bytes`. A file that is already plain is copied through.
-pub fn unlock(bytes: &[u8]) -> Result<Vec<u8>> {
+/// The key material of one database, kept so a playlist edit can lock the file again without
+/// deriving the key a second time.
+#[derive(Clone)]
+pub struct Seal {
+    salt: [u8; SALT_LEN],
+    key: [u8; 32],
+    hmac_key: [u8; 32],
+    params: Params,
+}
+
+impl Seal {
+    /// Locks `plain` with this database's key. `plain` must be the SQLite image [`open`]
+    /// returned, possibly after a playlist edit, and a whole number of pages.
+    pub fn lock(&self, plain: &[u8]) -> Result<Vec<u8>> {
+        if !plain.starts_with(SQLITE_HEADER) {
+            bail!("the rekordbox database is not a SQLite file");
+        }
+        if !plain.len().is_multiple_of(self.params.page_size) {
+            bail!("the rekordbox database is not a whole number of pages");
+        }
+        let reserve = self.params.reserve();
+        let pages = plain.len() / self.params.page_size;
+        let mut locked = Vec::with_capacity(plain.len());
+        for number in 1..=pages {
+            let start = (number - 1) * self.params.page_size;
+            let page = &plain[start..start + self.params.page_size];
+            locked.extend(encrypt_page(
+                page,
+                number as u32,
+                &self.salt,
+                &self.key,
+                &self.hmac_key,
+                self.params,
+                reserve,
+            )?);
+        }
+        Ok(locked)
+    }
+
+    /// Bytes at the end of each page that SQLCipher keeps for the IV and the HMAC. SQLite must
+    /// leave them unused, or locking the file would drop them.
+    pub fn reserve(&self) -> usize {
+        self.params.reserve()
+    }
+
+    pub fn page_size(&self) -> usize {
+        self.params.page_size
+    }
+
+    /// Decrypts `bytes` with this key. `None` when the file was rewritten with a different salt,
+    /// so the caller can open it from scratch.
+    pub fn reveal(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        if bytes.starts_with(SQLITE_HEADER) {
+            return Some(bytes.to_vec());
+        }
+        if bytes.len() < SALT_LEN || bytes[..SALT_LEN] != self.salt {
+            return None;
+        }
+        if !bytes.len().is_multiple_of(self.params.page_size) {
+            return None;
+        }
+        let pages = bytes.len() / self.params.page_size;
+        let mut plain = Vec::with_capacity(bytes.len());
+        for number in 1..=pages {
+            let start = (number - 1) * self.params.page_size;
+            let page = &bytes[start..start + self.params.page_size];
+            plain.extend(decrypt_page(
+                page,
+                number as u32,
+                &self.key,
+                &self.hmac_key,
+                self.params,
+            )?);
+        }
+        plain.starts_with(SQLITE_HEADER).then_some(plain)
+    }
+}
+
+/// Opens `bytes` and keeps the key that locked it. A plain SQLite file gets a fresh SQLCipher 4
+/// key, so the first playlist edit can still be written in the form rekordbox opens.
+pub fn open(bytes: &[u8]) -> Result<(Vec<u8>, Seal)> {
     if bytes.starts_with(SQLITE_HEADER) {
-        return Ok(bytes.to_vec());
+        let page_size = page_size(bytes)?;
+        return Ok((bytes.to_vec(), Seal::fresh(page_size)));
     }
     if bytes.len() < SALT_LEN {
         bail!("the rekordbox database is too small to be a database");
@@ -75,32 +158,74 @@ pub fn unlock(bytes: &[u8]) -> Result<Vec<u8>> {
         if !bytes.len().is_multiple_of(params.page_size) {
             continue;
         }
-        if let Some(plain) = decrypt(bytes, params) {
-            return Ok(plain);
+        if let Some((plain, seal)) = decrypt(bytes, params) {
+            return Ok((plain, seal));
         }
     }
     bail!("cannot unlock the rekordbox database")
 }
 
+fn page_size(bytes: &[u8]) -> Result<usize> {
+    let raw = bytes
+        .get(16..18)
+        .and_then(|field| field.try_into().ok())
+        .map(u16::from_be_bytes)
+        .unwrap_or(0);
+    let size = match raw {
+        1 => 65_536,
+        0 => 0,
+        value => value as usize,
+    };
+    if size < 512 || !size.is_multiple_of(AES_BLOCK) {
+        bail!("the rekordbox database has no page size");
+    }
+    Ok(size)
+}
+
+impl Seal {
+    fn fresh(page_size: usize) -> Self {
+        let mut salt = [0u8; SALT_LEN];
+        fastrand::fill(&mut salt);
+        let params = Params { page_size, ..V4 };
+        Self::from_salt(salt, params)
+    }
+
+    fn from_salt(salt: [u8; SALT_LEN], params: Params) -> Self {
+        let key = derive(params, PASSPHRASE, &salt, params.kdf_rounds);
+        let mut hmac_salt = [0u8; SALT_LEN];
+        for (out, byte) in hmac_salt.iter_mut().zip(salt) {
+            *out = byte ^ HMAC_SALT_MASK;
+        }
+        let hmac_key = derive(params, &key, &hmac_salt, HMAC_KDF_ROUNDS);
+        Self {
+            salt,
+            key,
+            hmac_key,
+            params,
+        }
+    }
+}
+
 /// Decrypts every page. `None` when the first page does not come out as a SQLite header, which
 /// is how a wrong passphrase or the wrong cipher version is told apart from a real database.
-fn decrypt(bytes: &[u8], params: Params) -> Option<Vec<u8>> {
-    let salt = bytes.get(..SALT_LEN)?;
-    let key = derive(params, PASSPHRASE, salt, params.kdf_rounds);
-    let mut hmac_salt = [0u8; SALT_LEN];
-    for (out, byte) in hmac_salt.iter_mut().zip(salt) {
-        *out = byte ^ HMAC_SALT_MASK;
-    }
-    let hmac_key = derive(params, &key, &hmac_salt, HMAC_KDF_ROUNDS);
+fn decrypt(bytes: &[u8], params: Params) -> Option<(Vec<u8>, Seal)> {
+    let salt: [u8; SALT_LEN] = bytes.get(..SALT_LEN)?.try_into().ok()?;
+    let seal = Seal::from_salt(salt, params);
 
     let pages = bytes.len() / params.page_size;
     let mut plain = Vec::with_capacity(bytes.len());
     for number in 1..=pages {
         let start = (number - 1) * params.page_size;
         let page = &bytes[start..start + params.page_size];
-        plain.extend(decrypt_page(page, number as u32, &key, &hmac_key, params)?);
+        plain.extend(decrypt_page(
+            page,
+            number as u32,
+            &seal.key,
+            &seal.hmac_key,
+            params,
+        )?);
     }
-    plain.starts_with(SQLITE_HEADER).then_some(plain)
+    plain.starts_with(SQLITE_HEADER).then_some((plain, seal))
 }
 
 fn derive(params: Params, password: &[u8], salt: &[u8], rounds: u32) -> [u8; 32] {
@@ -150,6 +275,39 @@ fn decrypt_page(
     Some(plain)
 }
 
+fn encrypt_page(
+    page: &[u8],
+    number: u32,
+    salt: &[u8; SALT_LEN],
+    key: &[u8; 32],
+    hmac_key: &[u8; 32],
+    params: Params,
+    reserve: usize,
+) -> Result<Vec<u8>> {
+    let iv_at = params.page_size - reserve;
+    let body_at = if number == 1 { SALT_LEN } else { 0 };
+    if iv_at < body_at + AES_BLOCK || page.len() != params.page_size {
+        bail!("a rekordbox page is the wrong size");
+    }
+    let mut iv = [0u8; AES_BLOCK];
+    fastrand::fill(&mut iv);
+    let encrypted = cbc_encrypt(key, &iv, &page[body_at..iv_at])?;
+    let signed = [encrypted.as_slice(), iv.as_slice()].concat();
+    let mac = match params.sha512 {
+        true => mac_bytes::<Sha512>(hmac_key, &signed, number)?,
+        false => mac_bytes::<Sha1>(hmac_key, &signed, number)?,
+    };
+
+    let mut locked = vec![0u8; params.page_size];
+    if number == 1 {
+        locked[..SALT_LEN].copy_from_slice(salt);
+    }
+    locked[body_at..iv_at].copy_from_slice(&encrypted);
+    locked[iv_at..iv_at + AES_BLOCK].copy_from_slice(&iv);
+    locked[iv_at + AES_BLOCK..iv_at + AES_BLOCK + mac.len()].copy_from_slice(&mac);
+    Ok(locked)
+}
+
 fn mac_ok<D>(key: &[u8], message: &[u8], page: u32, stored: &[u8]) -> bool
 where
     D: EagerHash + FixedOutputReset,
@@ -161,6 +319,18 @@ where
     mac.update(message);
     mac.update(&page.to_le_bytes());
     mac.verify_slice(stored).is_ok()
+}
+
+fn mac_bytes<D>(key: &[u8], message: &[u8], page: u32) -> Result<Vec<u8>>
+where
+    D: EagerHash + FixedOutputReset,
+    Hmac<D>: Mac,
+{
+    let mut mac = Hmac::<D>::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("cannot sign a rekordbox page"))?;
+    mac.update(message);
+    mac.update(&page.to_le_bytes());
+    Ok(mac.finalize().into_bytes().to_vec())
 }
 
 fn cbc_decrypt(key: &[u8; 32], iv: &[u8], encrypted: &[u8]) -> Result<Vec<u8>> {
@@ -182,4 +352,37 @@ fn cbc_decrypt(key: &[u8; 32], iv: &[u8], encrypted: &[u8]) -> Result<Vec<u8>> {
         plain.extend_from_slice(block.as_slice());
     }
     Ok(plain)
+}
+
+fn cbc_encrypt(key: &[u8; 32], iv: &[u8], plain: &[u8]) -> Result<Vec<u8>> {
+    if !plain.len().is_multiple_of(AES_BLOCK) {
+        bail!("a rekordbox page is not a whole number of cipher blocks");
+    }
+    let key = Array::from(*key);
+    let cipher = Aes256::new(&key);
+    let mut previous = [0u8; AES_BLOCK];
+    previous.copy_from_slice(iv);
+    let mut encrypted = Vec::with_capacity(plain.len());
+    for chunk in plain.chunks(AES_BLOCK) {
+        let mut block = Array::from_fn(|index| chunk[index] ^ previous[index]);
+        cipher.encrypt_block(&mut block);
+        previous.copy_from_slice(block.as_slice());
+        encrypted.extend_from_slice(block.as_slice());
+    }
+    Ok(encrypted)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lock_roundtrips_the_fixture() {
+        let (plain, seal) = open(include_bytes!("fixture.db")).expect("open");
+        let locked = seal.lock(&plain).expect("lock");
+        assert!(!locked.starts_with(SQLITE_HEADER));
+        let (again, _) = open(&locked).expect("unlock locked");
+        assert_eq!(again, plain);
+        assert_eq!(plain[20], 80, "reserved byte");
+    }
 }

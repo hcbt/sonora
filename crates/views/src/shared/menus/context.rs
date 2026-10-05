@@ -952,7 +952,8 @@ pub(crate) fn playlist_menu(playlist: Playlist, playback: Entity<Playback>, cx: 
     let public = playlist.public;
     let pinnable = playlist.pin();
     let imported = music::is_local_id(&playlist.id);
-    let visibility = (!imported).then(|| {
+    let rekordbox = music::rekordbox::is_rekordbox_id(&playlist.id);
+    let visibility = (!imported && !rekordbox).then(|| {
         MenuItem::new(
             "playlist-visibility",
             match public {
@@ -1020,7 +1021,7 @@ pub(crate) fn playlist_menu(playlist: Playlist, playback: Entity<Playback>, cx: 
                     }),
             ],
             actions,
-            match imported {
+            match imported || rekordbox {
                 true => Vec::new(),
                 false => vec![
                     MenuItem::new("copy-playlist-link", t!("menu-copy-link"))

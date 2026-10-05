@@ -1,7 +1,9 @@
-//! The rekordbox collection as a [`MusicApi`]. The database is read once when the library opens;
-//! stars are the only thing written, and they stay in Sonora.
+//! The rekordbox collection as a [`MusicApi`]. Stars stay in Sonora. Playlist create, rename,
+//! delete and track edits are written back to `master.db`.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Mutex;
 
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
@@ -13,37 +15,49 @@ use crate::{
     distinct_covers,
 };
 
+use super::cipher::Seal;
 use super::ids;
 use super::read::Catalog;
 use super::stars::{Kind, Stars};
-
-const READ_ONLY: &str = "rekordbox playlists are read from the database";
+use super::write::{self, Edit};
 
 pub struct Client {
-    catalog: Catalog,
+    catalog: Mutex<Catalog>,
+    database: PathBuf,
+    seal: Mutex<Seal>,
+    writing: Mutex<()>,
     stars: Stars,
 }
 
 impl Client {
-    pub fn new(catalog: Catalog, database: Database) -> Self {
+    pub fn new(catalog: Catalog, database: PathBuf, seal: Seal, stars: Database) -> Self {
         Self {
-            catalog,
-            stars: Stars::new(database),
+            catalog: Mutex::new(catalog),
+            database,
+            seal: Mutex::new(seal),
+            writing: Mutex::new(()),
+            stars: Stars::new(stars),
         }
     }
 
-    fn track(&self, id: &str) -> Option<&Track> {
-        self.catalog
+    fn catalog(&self) -> std::sync::MutexGuard<'_, Catalog> {
+        self.catalog.lock().unwrap_or_else(|err| err.into_inner())
+    }
+
+    fn track(&self, id: &str) -> Option<Track> {
+        self.catalog()
             .tracks
             .iter()
             .find(|track| track.id.as_deref() == Some(id))
+            .cloned()
     }
 
-    fn playlist(&self, id: &str) -> Result<&super::read::PlaylistEntry> {
-        self.catalog
+    fn playlist(&self, id: &str) -> Result<super::read::PlaylistEntry> {
+        self.catalog()
             .playlists
             .iter()
             .find(|playlist| playlist.id == id)
+            .cloned()
             .ok_or_else(|| anyhow!("cannot find rekordbox playlist {id}"))
     }
 
@@ -54,6 +68,20 @@ impl Client {
             .into_iter()
             .map(|(id, _)| id)
             .collect()
+    }
+
+    fn edit(&self, edit: Edit) -> Result<String> {
+        let _gate = self.writing.lock().unwrap_or_else(|err| err.into_inner());
+        let seal = self
+            .seal
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clone();
+        let saved = write::commit(&self.database, &seal, edit)?;
+        *self.seal.lock().unwrap_or_else(|err| err.into_inner()) = saved.seal;
+        let id = saved.playlist_id;
+        *self.catalog.lock().unwrap_or_else(|err| err.into_inner()) = saved.catalog;
+        Ok(id)
     }
 }
 
@@ -97,8 +125,8 @@ impl MusicApi for Client {
     }
 
     async fn artist(&self, artist_id: &str) -> Result<Artist> {
-        let artist = self
-            .catalog
+        let catalog = self.catalog();
+        let artist = catalog
             .artists
             .iter()
             .find(|artist| artist.id == artist_id)
@@ -109,8 +137,7 @@ impl MusicApi for Client {
             cover_large: artist.cover,
             biography: None,
             monthly_listeners: None,
-            top_tracks: self
-                .catalog
+            top_tracks: catalog
                 .tracks
                 .iter()
                 .filter(|track| {
@@ -121,8 +148,7 @@ impl MusicApi for Client {
                 })
                 .cloned()
                 .collect(),
-            albums: self
-                .catalog
+            albums: catalog
                 .albums
                 .iter()
                 .filter(|album| {
@@ -146,10 +172,11 @@ impl MusicApi for Client {
     }
 
     async fn artist_images(&self, ids: Vec<String>) -> Result<HashMap<String, String>> {
+        let catalog = self.catalog();
         Ok(ids
             .into_iter()
             .filter_map(|id| {
-                self.catalog
+                catalog
                     .artists
                     .iter()
                     .find(|artist| artist.id == id)
@@ -161,10 +188,7 @@ impl MusicApi for Client {
 
     async fn saved_tracks(&self) -> Result<Vec<Track>> {
         let ids = self.starred_ids(Kind::Track);
-        Ok(ids
-            .iter()
-            .filter_map(|id| self.track(id).cloned())
-            .collect())
+        Ok(ids.iter().filter_map(|id| self.track(id)).collect())
     }
 
     async fn set_track_saved(&self, track_id: &str, saved: bool) -> Result<()> {
@@ -173,7 +197,6 @@ impl MusicApi for Client {
 
     async fn track(&self, track_id: &str) -> Result<Track> {
         self.track(track_id)
-            .cloned()
             .ok_or_else(|| anyhow!("cannot find rekordbox track {track_id}"))
     }
 
@@ -182,39 +205,56 @@ impl MusicApi for Client {
     }
 
     async fn playlists(&self) -> Result<Vec<Playlist>> {
-        Ok(self.catalog.playlists.iter().map(playlist_model).collect())
+        Ok(self
+            .catalog()
+            .playlists
+            .iter()
+            .map(playlist_model)
+            .collect())
     }
 
-    async fn create_playlist(&self, _name: &str) -> Result<String> {
-        anyhow::bail!(READ_ONLY)
+    async fn create_playlist(&self, name: &str) -> Result<String> {
+        self.edit(Edit::Create(name.to_owned()))
     }
 
-    async fn rename_playlist(&self, _playlist_id: &str, _name: &str) -> Result<()> {
-        anyhow::bail!(READ_ONLY)
+    async fn rename_playlist(&self, playlist_id: &str, name: &str) -> Result<()> {
+        self.edit(Edit::Rename {
+            playlist: playlist_id.to_owned(),
+            name: name.to_owned(),
+        })
+        .map(|_| ())
     }
 
-    async fn delete_playlist(&self, _playlist_id: &str) -> Result<()> {
-        anyhow::bail!(READ_ONLY)
+    async fn delete_playlist(&self, playlist_id: &str) -> Result<()> {
+        self.edit(Edit::Delete(playlist_id.to_owned())).map(|_| ())
     }
 
-    async fn remove_playlist_from_library(&self, _playlist_id: &str) -> Result<()> {
-        anyhow::bail!(READ_ONLY)
+    async fn remove_playlist_from_library(&self, playlist_id: &str) -> Result<()> {
+        self.delete_playlist(playlist_id).await
     }
 
     async fn add_playlist_to_library(&self, _playlist_id: &str) -> Result<()> {
-        anyhow::bail!(READ_ONLY)
+        anyhow::bail!("a rekordbox playlist is already in the library")
     }
 
     async fn set_playlist_public(&self, _playlist_id: &str, _public: bool) -> Result<()> {
-        anyhow::bail!(READ_ONLY)
+        anyhow::bail!("rekordbox playlists have no public setting")
     }
 
-    async fn add_track_to_playlist(&self, _playlist_id: &str, _track_id: &str) -> Result<()> {
-        anyhow::bail!(READ_ONLY)
+    async fn add_track_to_playlist(&self, playlist_id: &str, track_id: &str) -> Result<()> {
+        self.edit(Edit::Add {
+            playlist: playlist_id.to_owned(),
+            track: track_id.to_owned(),
+        })
+        .map(|_| ())
     }
 
-    async fn remove_track_from_playlist(&self, _playlist_id: &str, _track_id: &str) -> Result<()> {
-        anyhow::bail!(READ_ONLY)
+    async fn remove_track_from_playlist(&self, playlist_id: &str, track_id: &str) -> Result<()> {
+        self.edit(Edit::Remove {
+            playlist: playlist_id.to_owned(),
+            track: track_id.to_owned(),
+        })
+        .map(|_| ())
     }
 
     async fn saved_albums(&self) -> Result<Vec<Album>> {
@@ -222,7 +262,7 @@ impl MusicApi for Client {
         Ok(ids
             .iter()
             .filter_map(|id| {
-                self.catalog
+                self.catalog()
                     .albums
                     .iter()
                     .find(|album| album.id == *id)
@@ -240,7 +280,7 @@ impl MusicApi for Client {
         Ok(ids
             .iter()
             .filter_map(|id| {
-                self.catalog
+                self.catalog()
                     .artists
                     .iter()
                     .find(|artist| artist.id == *id)
@@ -254,20 +294,20 @@ impl MusicApi for Client {
     }
 
     async fn all_tracks(&self) -> Result<Vec<Track>> {
-        Ok(self.catalog.tracks.clone())
+        Ok(self.catalog().tracks.clone())
     }
 
     async fn all_albums(&self) -> Result<Vec<Album>> {
-        Ok(self.catalog.albums.clone())
+        Ok(self.catalog().albums.clone())
     }
 
     async fn all_artists(&self) -> Result<Vec<SavedArtist>> {
-        Ok(self.catalog.artists.clone())
+        Ok(self.catalog().artists.clone())
     }
 
     async fn album(&self, album_id: &str) -> Result<AlbumDetail> {
         let album = self
-            .catalog
+            .catalog()
             .albums
             .iter()
             .find(|album| album.id == album_id)
@@ -281,7 +321,7 @@ impl MusicApi for Client {
 
     async fn album_tracks(&self, album_id: &str) -> Result<Vec<Track>> {
         let mut tracks: Vec<Track> = self
-            .catalog
+            .catalog()
             .tracks
             .iter()
             .filter(|track| track.album_id.as_deref() == Some(album_id))
@@ -301,7 +341,7 @@ impl MusicApi for Client {
         _artist_id: Option<&str>,
     ) -> Result<AlbumCatalogue> {
         let Some(artists) = self
-            .catalog
+            .catalog()
             .albums
             .iter()
             .find(|album| album.id == album_id)
@@ -311,7 +351,7 @@ impl MusicApi for Client {
         };
         Ok(AlbumCatalogue {
             also_like: self
-                .catalog
+                .catalog()
                 .albums
                 .iter()
                 .filter(|album| album.id != album_id && album.artists == artists)
@@ -325,19 +365,19 @@ impl MusicApi for Client {
     async fn playlist(&self, playlist_id: &str) -> Result<PlaylistDetail> {
         let entry = self.playlist(playlist_id)?;
         Ok(PlaylistDetail {
-            playlist: playlist_model(entry),
+            playlist: playlist_model(&entry),
             tracks: entry.tracks.clone(),
             continuation: None,
         })
     }
 
     async fn playlist_tracks(&self, playlist_id: &str) -> Result<Vec<Track>> {
-        Ok(self.playlist(playlist_id)?.tracks.clone())
+        Ok(self.playlist(playlist_id)?.tracks)
     }
 
     async fn playlist_covers(&self, playlist_id: &str, wanted: usize) -> Result<Vec<String>> {
-        let tracks = &self.playlist(playlist_id)?.tracks;
-        Ok(distinct_covers(tracks, wanted))
+        let entry = self.playlist(playlist_id)?;
+        Ok(distinct_covers(&entry.tracks, wanted))
     }
 
     async fn track_radio(
@@ -351,7 +391,7 @@ impl MusicApi for Client {
     async fn search(&self, query: &str) -> Result<Vec<Track>> {
         let query = query.to_lowercase();
         Ok(self
-            .catalog
+            .catalog()
             .tracks
             .iter()
             .filter(|track| {
@@ -366,7 +406,7 @@ impl MusicApi for Client {
     async fn search_albums(&self, query: &str) -> Result<Vec<Album>> {
         let query = query.to_lowercase();
         Ok(self
-            .catalog
+            .catalog()
             .albums
             .iter()
             .filter(|album| {
@@ -380,7 +420,7 @@ impl MusicApi for Client {
     async fn search_playlists(&self, query: &str) -> Result<Vec<Playlist>> {
         let query = query.to_lowercase();
         Ok(self
-            .catalog
+            .catalog()
             .playlists
             .iter()
             .filter(|playlist| playlist.name.to_lowercase().contains(&query))
@@ -390,11 +430,11 @@ impl MusicApi for Client {
 
     async fn home(&self) -> Result<HomeFeed> {
         let mut sections = Vec::new();
-        if !self.catalog.playlists.is_empty() {
+        if !self.catalog().playlists.is_empty() {
             sections.push(GenreSection {
                 title: "home-playlists".to_owned(),
                 items: self
-                    .catalog
+                    .catalog()
                     .playlists
                     .iter()
                     .take(15)
@@ -403,11 +443,11 @@ impl MusicApi for Client {
                     .collect(),
             });
         }
-        if !self.catalog.albums.is_empty() {
+        if !self.catalog().albums.is_empty() {
             sections.push(GenreSection {
                 title: "home-collection-albums".to_owned(),
                 items: self
-                    .catalog
+                    .catalog()
                     .albums
                     .iter()
                     .take(15)
