@@ -27,6 +27,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Rekordbox tracks show the artwork stored with the library.
+
 - Turning on the BPM or Key column keeps it on the track list, including when the songs have no
   tempo or key yet.
 
