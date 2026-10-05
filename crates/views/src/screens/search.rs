@@ -19,9 +19,9 @@ use state::{
 };
 use ui::ActiveTheme as _;
 use ui::{
-    Activate, Card, Deck, Deselect, Pinnable, Popup, Room, Scrollbar, Scroller, SelectLeft,
-    SelectNext, SelectPrevious, SelectRight, Separator, Text, Theme, VAST, clock, eyebrow,
-    scrolled, snapped, tabular, vacant,
+    Activate, Card, Deck, Deselect, MenuItem, Picker, Pinnable, Popovers, Popup, Room, Scrollbar,
+    Scroller, SelectLeft, SelectNext, SelectPrevious, SelectRight, Separator, Text, Theme, VAST,
+    clock, eyebrow, scrolled, snapped, tabular, vacant,
 };
 
 use crate::shared::cards;
@@ -34,7 +34,8 @@ const RAIL: Pixels = gpui::px(12.);
 const ROW_GAP: f32 = 0.25;
 const SONGS: &[Kind] = &[Kind::Song];
 const ARTISTS: &[Kind] = &[Kind::Artist];
-const RELEASES: &[Kind] = &[Kind::Album, Kind::Playlist];
+const ALBUMS: &[Kind] = &[Kind::Album];
+const PLAYLISTS: &[Kind] = &[Kind::Playlist];
 use crate::shared::tracks::{PlaybackStatus, playback_status};
 
 type Play = Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
@@ -75,13 +76,15 @@ pub(crate) struct SearchView {
     songs: Entity<Scrollbar>,
     artists: Entity<Scrollbar>,
     albums: Entity<Scrollbar>,
+    playlists: Entity<Scrollbar>,
     mixed: Entity<Scrollbar>,
     browsing: Entity<Scrollbar>,
     track_menu: ItemMenu,
+    popovers: Popovers,
     context_menu: Option<(HitMenu, Point<Pixels>)>,
     focus: FocusHandle,
     cursor: Option<(usize, usize)>,
-    rows: [usize; 3],
+    rows: [usize; 4],
     lead: Rc<Cell<Pixels>>,
 }
 
@@ -110,7 +113,7 @@ impl SearchView {
             this.track_menu.reset(cx);
             this.context_menu = None;
             this.cursor = None;
-            this.rows = [0; 3];
+            this.rows = [0; 4];
             cx.notify();
         })
         .detach();
@@ -143,19 +146,41 @@ impl SearchView {
             songs: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(me)),
             artists: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(me)),
             albums: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(me)),
+            playlists: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(me)),
             mixed: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(me)),
             browsing: cx.new(|_| Scrollbar::new(ScrollHandle::new()).watching(me)),
             track_menu: ItemMenu::new(playlist_scrollbar, cx),
+            popovers: Popovers::default(),
             context_menu: None,
             focus: cx.focus_handle(),
             cursor: None,
-            rows: [0; 3],
+            rows: [0; 4],
             lead: Rc::new(Cell::new(Pixels::ZERO)),
         }
     }
 
     pub(crate) fn focus(&self, window: &mut Window, cx: &mut App) {
         self.input.update(cx, |input, cx| input.focus(window, cx));
+    }
+
+    fn source_picker(&self, cx: &App) -> Option<impl IntoElement> {
+        let search = self.search.read(cx);
+        let slug = search.source(cx)?;
+        let sources = search.sources(cx);
+        let current = source_name(slug, cx);
+        let picker = Picker::new("search-source", &self.popovers, current)
+            .width(Picker::NARROW)
+            .items(sources.into_iter().map(|source| {
+                let selected = source == slug;
+                let search = self.search.clone();
+                MenuItem::new(source, source_name(source, cx))
+                    .icon(source_icon(source))
+                    .selected(selected)
+                    .on_click(move |_, _, cx| {
+                        search.update(cx, |search, cx| search.set_source(source, cx));
+                    })
+            }));
+        Some(picker)
     }
 
     fn select_next(&mut self, _: &SelectNext, window: &mut Window, cx: &mut Context<Self>) {
@@ -332,7 +357,8 @@ impl SearchView {
             (true, _) => &self.mixed,
             (false, 0) => &self.songs,
             (false, 1) => &self.artists,
-            _ => &self.albums,
+            (false, 2) => &self.albums,
+            _ => &self.playlists,
         }
     }
 
@@ -635,7 +661,8 @@ impl SearchView {
         let (title, only) = match kind {
             Kind::Song => (t!("search-songs"), SONGS),
             Kind::Artist => (t!("search-artists"), ARTISTS),
-            Kind::Album | Kind::Playlist => (t!("search-albums-playlists"), RELEASES),
+            Kind::Album => (t!("search-albums"), ALBUMS),
+            Kind::Playlist => (t!("search-playlists"), PLAYLISTS),
         };
         let body = self.deck(only, RAIL, None, window, cx);
 
@@ -705,7 +732,8 @@ impl SearchView {
         let (id, bar) = match only {
             [Kind::Song] => ("search-songs", &self.songs),
             [Kind::Artist] => ("search-artists", &self.artists),
-            [Kind::Album, Kind::Playlist] => ("search-albums", &self.albums),
+            [Kind::Album] => ("search-albums", &self.albums),
+            [Kind::Playlist] => ("search-playlists", &self.playlists),
             _ => ("search-all", &self.mixed),
         };
         let seats = self.seats(only, cx);
@@ -775,6 +803,26 @@ impl SearchView {
             .into_any_element()
     }
 }
+fn source_name(slug: &str, cx: &App) -> SharedString {
+    match slug {
+        "local" => t!("nav-local"),
+        "rekordbox" => t!("nav-rekordbox"),
+        _ => Sonora::global(cx)
+            .session
+            .read(cx)
+            .name_of(slug)
+            .unwrap_or(slug)
+            .into(),
+    }
+}
+
+fn source_icon(slug: &str) -> &'static str {
+    match slug {
+        "local" => "icons/file-music.svg",
+        "rekordbox" => "icons/list-music.svg",
+        other => crate::shared::provider_logo(other),
+    }
+}
 
 fn stacked(window: &Window, cx: &App) -> bool {
     !Chrome::room(window, cx).fits(Room::Wide)
@@ -783,7 +831,7 @@ fn stacked(window: &Window, cx: &App) -> bool {
 fn columns(stacked: bool) -> usize {
     match stacked {
         true => 1,
-        false => 3,
+        false => 4,
     }
 }
 
@@ -792,7 +840,8 @@ fn kinds(column: usize, stacked: bool) -> &'static [Kind] {
         (true, _) => &Kind::ALL,
         (false, 0) => SONGS,
         (false, 1) => ARTISTS,
-        _ => RELEASES,
+        (false, 2) => ALBUMS,
+        _ => PLAYLISTS,
     }
 }
 
@@ -800,7 +849,8 @@ fn column_of(only: &[Kind]) -> usize {
     match only {
         [Kind::Song] => 0,
         [Kind::Artist] => 1,
-        [Kind::Album, Kind::Playlist] => 2,
+        [Kind::Album] => 2,
+        [Kind::Playlist] => 3,
         _ => 0,
     }
 }
@@ -1010,6 +1060,8 @@ impl Render for SearchView {
                     .child(self.column(Kind::Artist, window, cx))
                     .child(Separator::vertical())
                     .child(self.column(Kind::Album, window, cx))
+                    .child(Separator::vertical())
+                    .child(self.column(Kind::Playlist, window, cx))
                     .into_any_element(),
             },
         };
@@ -1032,8 +1084,11 @@ impl Render for SearchView {
                 div()
                     .flex()
                     .flex_none()
+                    .items_center()
+                    .gap_2()
                     .px(gutter)
-                    .child(self.input.clone()),
+                    .child(div().flex_1().min_w_0().child(self.input.clone()))
+                    .children(self.source_picker(cx)),
             )
             .when(!stacked, |this| {
                 this.children(self.best(cx).map(|best| div().px(gutter).child(best)))

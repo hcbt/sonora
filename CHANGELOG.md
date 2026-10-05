@@ -18,7 +18,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tracks. Close rekordbox first; the change is in its library, so it is there when rekordbox
   opens.
 - Each library lists its playlists in the sidebar. Open the Playlists row to see them, and
-  drop a track on one to add it.
+  drop a track from that same library on one to add it, even if the track is not saved yet.
+- Search says which library it is searching, and the picker next to the field switches it.
+  Albums and playlists are listed in their own columns.
 - Spotify, YouTube Music and the other accounts can stay signed in together. Each one has its
   own library in the sidebar, next to Local Music, and search, home and playback use whichever
   account the song belongs to.

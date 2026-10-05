@@ -780,7 +780,6 @@ impl SidebarLeft {
             true => theme.foreground,
             false => theme.muted_foreground,
         };
-        let toggle = page.clone();
         let button = nav_row(
             SharedString::from(format!("library-playlists-{key}")),
             "nav-playlists",
@@ -791,11 +790,7 @@ impl SidebarLeft {
         .trailing(chevron(open))
         .when(chosen, |button| button.bg(accent))
         .on_click(cx.listener(move |this, _, _, cx| {
-            let opening = !this.playlists_open(key);
             this.flip_playlists(key);
-            if opening {
-                navigate(toggle.clone(), cx);
-            }
             cx.notify();
         }));
         div()
@@ -862,26 +857,29 @@ impl SidebarLeft {
             true => theme.foreground,
             false => theme.muted_foreground,
         };
-        let button = named_row(
-            SharedString::from(format!("sidebar-playlist-{id}")),
-            playlist.name.clone().into(),
-            tint,
-            accent,
-        )
-        .icon("icons/list.svg")
-        .when(active || hot, |button| button.bg(accent))
-        .on_click({
-            let opened = destination.clone();
-            move |_, _, cx| navigate(opened.clone(), cx)
-        });
-
+        let name = playlist.name.clone();
+        let height = theme.metrics.control;
         let hover_id = id.clone();
-        let drop_id = id.clone();
+        let drop_id = id;
         div()
-            .id(SharedString::from(format!("sidebar-playlist-drop-{id}")))
+            .id(SharedString::from(format!("sidebar-playlist-{drop_id}")))
+            .flex()
+            .items_center()
+            .gap_2()
+            .h(height)
             .w_full()
             .min_w_0()
-            .child(button)
+            .px_2()
+            .rounded(theme.radius)
+            .text_size(theme.text(Text::Small))
+            .text_color(tint)
+            .cursor_pointer()
+            .when(active || hot, |row| row.bg(accent))
+            .hover(move |style| style.bg(accent))
+            .on_click({
+                let opened = destination;
+                move |_, _, cx| navigate(opened.clone(), cx)
+            })
             .on_drag_move(
                 cx.listener(move |this, event: &DragMoveEvent<DraggedPin>, _, cx| {
                     this.hover_playlist(shelf, &hover_id, editable, event, cx);
@@ -890,6 +888,14 @@ impl SidebarLeft {
             .on_drop(cx.listener(move |this, dragged: &DraggedPin, _, cx| {
                 this.drop_on_playlist(shelf, &drop_id, editable, dragged, cx);
             }))
+            .child(
+                svg()
+                    .path(icons::path("icons/list.svg"))
+                    .flex_none()
+                    .size(theme.text(Text::Small))
+                    .text_color(tint),
+            )
+            .child(div().min_w_0().truncate().child(name))
             .into_any_element()
     }
 

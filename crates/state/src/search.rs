@@ -128,6 +128,8 @@ pub struct Search {
     hits: Vec<Hit>,
     loading: bool,
     error: Option<String>,
+    /// The library search is limited to. Empty until the listener picks one, then the slug.
+    source: Option<String>,
     session: Entity<Session>,
     library: Entity<Library>,
     io: Io,
@@ -168,6 +170,7 @@ impl Search {
             hits: Vec::new(),
             loading: false,
             error: None,
+            source: None,
             session,
             library,
             io,
@@ -211,18 +214,59 @@ impl Search {
         self.loading = false;
         self.error = None;
     }
-    fn clients(&self, cx: &App) -> Vec<Arc<dyn music::MusicApi>> {
+    /// Libraries search can use: signed-in accounts, then local files and rekordbox when open.
+    pub fn sources(&self, cx: &App) -> Vec<&'static str> {
         let session = self.session.read(cx);
-        let mut clients = Vec::new();
-        for (slug, _) in session.libraries() {
-            if let Some(client) = session.client_of(Shelf::Account(slug)) {
-                clients.push(client);
-            }
+        let mut slugs: Vec<&'static str> = session
+            .libraries()
+            .into_iter()
+            .map(|(slug, _)| slug)
+            .collect();
+        if session.local_client().is_some() {
+            slugs.push("local");
         }
-        if let Some(local) = session.local_client() {
-            clients.push(local);
+        if session.client_of(Shelf::Rekordbox).is_some() {
+            slugs.push("rekordbox");
         }
-        clients
+        slugs
+    }
+
+    /// The library the current search reads. The first available one until the listener picks.
+    pub fn source(&self, cx: &App) -> Option<&'static str> {
+        let sources = self.sources(cx);
+        self.source
+            .as_deref()
+            .and_then(|saved| sources.iter().copied().find(|slug| *slug == saved))
+            .or_else(|| sources.first().copied())
+    }
+
+    /// Limits later searches to `slug` and runs the current query again.
+    pub fn set_source(&mut self, slug: &str, cx: &mut Context<Self>) {
+        if self.source.as_deref() == Some(slug) {
+            return;
+        }
+        if !self.sources(cx).contains(&slug) {
+            return;
+        }
+        self.source = Some(slug.to_owned());
+        self.served = None;
+        self.loading = false;
+        let query = self.query.clone();
+        self.ask(&query, cx);
+    }
+
+    fn client(&self, cx: &App) -> Option<Arc<dyn music::MusicApi>> {
+        let slug = self.source(cx)?;
+        let session = self.session.read(cx);
+        match slug {
+            "local" => session.local_client(),
+            "rekordbox" => session.client_of(Shelf::Rekordbox),
+            slug => session
+                .libraries()
+                .into_iter()
+                .find(|(known, _)| *known == slug)
+                .and_then(|(known, _)| session.client_of(Shelf::Account(known))),
+        }
     }
 
     pub fn ask(&mut self, query: &str, cx: &mut Context<Self>) {
@@ -245,7 +289,7 @@ impl Search {
 
         self.rank(cx);
 
-        let clients = self.clients(cx);
+        let clients = self.client(cx).into_iter().collect::<Vec<_>>();
         if clients.is_empty() {
             self.loading = false;
             cx.notify();
