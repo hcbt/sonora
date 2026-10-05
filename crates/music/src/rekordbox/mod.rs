@@ -84,4 +84,5 @@ mod tests {
         assert_eq!(catalog.playlists[0].name, "Sets / Night");
         assert_eq!(catalog.playlists[0].tracks.len(), 1);
     }
+
 }

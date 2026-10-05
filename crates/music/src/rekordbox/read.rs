@@ -735,21 +735,29 @@ fn percent_decode(value: &str) -> String {
         .into_owned()
 }
 
-/// Artwork paths in the database are relative to the folder that holds `master.db`.
+/// Artwork paths in the database look absolute (`/PIONEER/Artwork/…`) but are rooted at the
+/// `share` directory beside `master.db`. A path that really is a file is used as written.
 fn artwork(root: &Path, image: &str) -> Option<String> {
-    let image = image.trim();
+    let image = image.trim().trim_end_matches('\0').replace('\\', "/");
     if image.is_empty() {
         return None;
     }
-    let path = PathBuf::from(image);
-    let candidates = match path.is_absolute() {
-        true => vec![path],
-        false => vec![root.join(&path), root.join("share").join(&path)],
-    };
-    candidates
+    let as_given = PathBuf::from(&image);
+    if as_given.is_file() {
+        return Some(located_file(&as_given));
+    }
+    let relative = Path::new(image.trim_start_matches('/'));
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    [root.join("share").join(relative), root.join(relative)]
         .into_iter()
         .find(|candidate| candidate.is_file())
-        .map(|candidate| format!("file://{}", candidate.display()))
+        .map(|candidate| located_file(&candidate))
+}
+
+fn located_file(path: &Path) -> String {
+    format!("file://{}", path.display())
 }
 
 trait OptionalRow {
@@ -763,5 +771,28 @@ impl OptionalRow for rusqlite::Result<()> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(error) => Err(error),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    #[test]
+    fn rooted_artwork_is_under_share() {
+        let root = std::env::temp_dir().join(format!("sonora-rekordbox-art-{}", std::process::id()));
+        let image = root.join("share/PIONEER/Artwork/9ed/example/artwork.jpg");
+        fs::create_dir_all(image.parent().unwrap()).unwrap();
+        fs::write(&image, b"jpg").unwrap();
+
+        let found = artwork(&root, "/PIONEER/Artwork/9ed/example/artwork.jpg");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(
+            found.as_deref(),
+            Some(format!("file://{}", image.display())).as_deref()
+        );
     }
 }
