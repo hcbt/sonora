@@ -17,6 +17,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   next to your music folders. Create, rename and delete its playlists, and add or remove
   tracks. Close rekordbox first; the change is in its library, so it is there when rekordbox
   opens.
+- Each library lists its playlists in the sidebar. Open the Playlists row to see them, and
+  drop a track on one to add it.
 - Spotify, YouTube Music and the other accounts can stay signed in together. Each one has its
   own library in the sidebar, next to Local Music, and search, home and playback use whichever
   account the song belongs to.

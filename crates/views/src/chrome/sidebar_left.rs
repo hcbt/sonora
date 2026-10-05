@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use ui::{
-    ActiveTheme as _, Button, Card, Deck, DraggedPin, Edge, MenuItem, Panel, Picker, Pin,
+    ActiveTheme as _, Button, Card, Deck, DraggedPin, Edge, MenuItem, Panel, Picker, Pin, PinKind,
     Pinnable as _, Popup, SNUG, Scroller, Shield, Side, Spot, Tabs, Text, Vacancy, drop_gap,
     drop_marker,
 };
@@ -102,6 +102,10 @@ pub(crate) struct SidebarLeft {
     local_open: bool,
     rekordbox_open: bool,
     pinned_open: bool,
+    /// Shelf keys whose playlist lists are open. A key is an account slug, `local`, or `rekordbox`.
+    playlists_open: Vec<String>,
+    /// The playlist a track is hovering, so the row can show it will take the drop.
+    dropping_on: Option<String>,
     dropping: bool,
     drop_gap: Option<usize>,
     playback: Entity<Playback>,
@@ -148,11 +152,11 @@ impl SidebarLeft {
         let local_open = matches!(at, Destination::Local(_));
         let rekordbox_open = matches!(at, Destination::Rekordbox(_));
 
-        Self {
+        let mut sidebar = Self {
             settings,
             session,
             trail,
-            at,
+            at: at.clone(),
             width,
             open,
             forced: None,
@@ -161,6 +165,8 @@ impl SidebarLeft {
             local_open,
             rekordbox_open,
             pinned_open,
+            playlists_open: Vec::new(),
+            dropping_on: None,
             dropping: false,
             drop_gap: None,
             playback,
@@ -170,19 +176,45 @@ impl SidebarLeft {
             context_menu: None,
             scrollbar,
             popovers: ui::Popovers::default(),
-        }
+        };
+        sidebar.reveal(&at, cx);
+        sidebar
     }
 
-    fn follow(&mut self, current: &Destination) {
+    fn follow(&mut self, current: &Destination, cx: &App) {
         if self.at == *current {
             return;
         }
         self.at = current.clone();
-        if let Destination::Library { account, .. } = current {
+        self.reveal(current, cx);
+    }
+
+    /// Opens the library, and its playlist list, that `current` belongs to.
+    fn reveal(&mut self, current: &Destination, cx: &App) {
+        if let Destination::Library { account, tab } = current {
             self.open_account(account);
+            if *tab == LibraryTab::Playlists {
+                self.open_playlists(account);
+            }
         }
         self.local_open |= matches!(current, Destination::Local(_));
         self.rekordbox_open |= matches!(current, Destination::Rekordbox(_));
+        if matches!(current, Destination::Local(LibraryTab::Playlists)) {
+            self.open_playlists("local");
+        }
+        if matches!(current, Destination::Rekordbox(LibraryTab::Playlists)) {
+            self.open_playlists("rekordbox");
+        }
+        if let Destination::Playlist(id) = current
+            && let Some(shelf) = self.session.read(cx).shelf_for(id)
+        {
+            match shelf {
+                Shelf::Account(slug) => self.open_account(slug),
+                Shelf::Local => self.local_open = true,
+                Shelf::Rekordbox => self.rekordbox_open = true,
+            }
+            self.open_playlists(shelf_key(shelf));
+        }
     }
 
     fn open_account(&mut self, slug: &str) {
@@ -202,6 +234,25 @@ impl SidebarLeft {
                 self.accounts_open.remove(index);
             }
             None => self.accounts_open.push(slug.to_owned()),
+        }
+    }
+
+    fn playlists_open(&self, key: &str) -> bool {
+        self.playlists_open.iter().any(|open| open == key)
+    }
+
+    fn open_playlists(&mut self, key: &str) {
+        if !self.playlists_open(key) {
+            self.playlists_open.push(key.to_owned());
+        }
+    }
+
+    fn flip_playlists(&mut self, key: &str) {
+        match self.playlists_open.iter().position(|open| open == key) {
+            Some(index) => {
+                self.playlists_open.remove(index);
+            }
+            None => self.playlists_open.push(key.to_owned()),
         }
     }
 
@@ -287,8 +338,9 @@ impl SidebarLeft {
         }
     }
 
-    /// The navigation entries, each followed by its tabs while its group is open.
-    fn navigation(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The navigation entries, each followed by its tabs while its group is open, and by its
+    /// playlists while that list is open.
+    fn navigation(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let show_libraries = self.settings.read(cx).nav_shown(NavEntry::Library.id());
         let accounts = self.library_rows(cx);
         let mut rows = Vec::new();
@@ -301,7 +353,9 @@ impl SidebarLeft {
                     for (slug, name) in &accounts {
                         rows.push(self.account_nav(slug, name, cx));
                         if self.account_open(slug) {
-                            rows.push(self.account_tabs(slug, cx));
+                            let shelf = Shelf::Account(slug);
+                            rows.push(self.library_tabs(shelf, cx));
+                            self.push_playlists(&mut rows, shelf, window, cx);
                         }
                     }
                 }
@@ -309,10 +363,30 @@ impl SidebarLeft {
             }
             rows.push(self.nav(index, cx));
             if let Some(group) = Group::of(&NAV[index].2).filter(|group| self.opened(*group)) {
-                rows.push(self.tabs(group, cx));
+                let shelf = match group {
+                    Group::Local => Shelf::Local,
+                    Group::Rekordbox => Shelf::Rekordbox,
+                };
+                rows.push(self.library_tabs(shelf, cx));
+                self.push_playlists(&mut rows, shelf, window, cx);
             }
         }
         rows
+    }
+
+    fn push_playlists(
+        &self,
+        rows: &mut Vec<AnyElement>,
+        shelf: Shelf,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.playlists_open(shelf_key(shelf))
+            || self.library.read(cx).state(shelf).playlists().is_empty()
+        {
+            return;
+        }
+        rows.push(self.playlist_branch(shelf, window, cx));
     }
 
     /// Signed-in libraries, plus a stored one whose snapshot is already on screen.
@@ -615,43 +689,6 @@ impl SidebarLeft {
         .into_any_element()
     }
 
-    /// The tabs under an expanded group.
-    fn tabs(&self, group: Group, cx: &mut Context<Self>) -> AnyElement {
-        let theme = *cx.theme();
-        let accent = theme.sidebar_accent;
-        let current = self.trail.read(cx).current();
-        let tab = |id: ElementId, key: &'static str, destination: Destination| {
-            let chosen = destination == current;
-            let tint = match chosen {
-                true => theme.foreground,
-                false => theme.muted_foreground,
-            };
-
-            nav_row(id, key, tint, accent)
-                .flex_1()
-                .when(chosen, |button| button.bg(accent))
-                .on_click(move |_, _, cx| navigate(destination.clone(), cx))
-        };
-
-        match group {
-            Group::Local => Tabs::new().items(LIBRARY_TABS.into_iter().enumerate().map(
-                |(slot, (name, tab_id))| {
-                    tab(("local-tab", slot).into(), name, Destination::Local(tab_id))
-                },
-            )),
-            Group::Rekordbox => Tabs::new().items(LIBRARY_TABS.into_iter().enumerate().map(
-                |(slot, (name, tab_id))| {
-                    tab(
-                        ("rekordbox-tab", slot).into(),
-                        name,
-                        Destination::Rekordbox(tab_id),
-                    )
-                },
-            )),
-        }
-        .into_any_element()
-    }
-
     fn account_nav(
         &self,
         slug: &'static str,
@@ -685,39 +722,225 @@ impl SidebarLeft {
         .into_any_element()
     }
 
-    fn account_tabs(&self, slug: &'static str, cx: &mut Context<Self>) -> AnyElement {
+    /// Songs, albums, artists, and a Playlists row that opens the lists themselves.
+    fn library_tabs(&self, shelf: Shelf, cx: &mut Context<Self>) -> AnyElement {
         let theme = *cx.theme();
         let accent = theme.sidebar_accent;
         let current = self.trail.read(cx).current();
-        let account = SharedString::from(slug);
-        Tabs::new()
-            .items(
-                LIBRARY_TABS
-                    .into_iter()
-                    .enumerate()
-                    .map(|(slot, (name, tab))| {
-                        let destination = Destination::Library {
-                            account: account.clone(),
-                            tab,
-                        };
-                        let chosen = destination == current;
-                        let tint = match chosen {
-                            true => theme.foreground,
-                            false => theme.muted_foreground,
-                        };
-                        named_row(
-                            SharedString::from(format!("library-tab-{slug}-{slot}")),
-                            i18n::lookup(name, None),
-                            tint,
-                            accent,
-                        )
-                        .flex_1()
-                        .when(chosen, |button| button.bg(accent))
-                        .on_click(move |_, _, cx| navigate(destination.clone(), cx))
-                    }),
+        let key = shelf_key(shelf);
+        let mut items = Vec::new();
+        for (slot, (name, tab)) in LIBRARY_TABS.into_iter().enumerate() {
+            let destination = shelf_destination(shelf, tab);
+            if tab == LibraryTab::Playlists {
+                items.push(self.playlists_header(shelf, destination, cx));
+                continue;
+            }
+            let chosen = destination == current;
+            let tint = match chosen {
+                true => theme.foreground,
+                false => theme.muted_foreground,
+            };
+            items.push(
+                named_row(
+                    SharedString::from(format!("library-tab-{key}-{slot}")),
+                    i18n::lookup(name, None),
+                    tint,
+                    accent,
+                )
+                .flex_1()
+                .when(chosen, |button| button.bg(accent))
+                .on_click(move |_, _, cx| navigate(destination.clone(), cx))
+                .into_any_element(),
+            );
+        }
+        Tabs::new().items(items).into_any_element()
+    }
+
+    /// The Playlists row. It opens and closes the lists under it, the way a library opens its tabs.
+    fn playlists_header(
+        &self,
+        shelf: Shelf,
+        page: Destination,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = shelf_key(shelf);
+        let open = self.playlists_open(key);
+        let theme = *cx.theme();
+        let accent = theme.sidebar_accent;
+        let current = self.trail.read(cx).current();
+        let chosen = current == page
+            || matches!(&current, Destination::Playlist(id) if self
+                .library
+                .read(cx)
+                .state(shelf)
+                .playlists()
+                .iter()
+                .any(|playlist| playlist.id == id.as_ref()));
+        let tint = match chosen {
+            true => theme.foreground,
+            false => theme.muted_foreground,
+        };
+        let toggle = page.clone();
+        let button = nav_row(
+            SharedString::from(format!("library-playlists-{key}")),
+            "nav-playlists",
+            tint,
+            accent,
+        )
+        .flex_1()
+        .trailing(chevron(open))
+        .when(chosen, |button| button.bg(accent))
+        .on_click(cx.listener(move |this, _, _, cx| {
+            let opening = !this.playlists_open(key);
+            this.flip_playlists(key);
+            if opening {
+                navigate(toggle.clone(), cx);
+            }
+            cx.notify();
+        }));
+        div()
+            .id(SharedString::from(format!("library-playlists-drop-{key}")))
+            .flex()
+            .flex_1()
+            .min_w_0()
+            .child(button)
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedPin>, _, cx| {
+                    if event.drag(cx).pin.kind != PinKind::Song
+                        || !event.bounds.contains(&event.event.position)
+                    {
+                        return;
+                    }
+                    if !this.playlists_open(key) {
+                        this.open_playlists(key);
+                        cx.notify();
+                    }
+                }),
             )
             .into_any_element()
     }
+
+    fn playlist_branch(&self, shelf: Shelf, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let listed = Rc::new(self.library.read(cx).state(shelf).playlists().to_vec());
+        let row = ui::snapped(cx.theme().metrics.control, window);
+        let count = listed.len();
+        div()
+            .ml(px(32.))
+            .w_full()
+            .min_w_0()
+            .child(
+                Deck::new(SharedString::from(format!(
+                    "sidebar-playlists-{}",
+                    shelf_key(shelf)
+                )))
+                .rows((0..count).map(|_| row))
+                .gap(ROW_GAP)
+                .draw(
+                    cx.processor(move |this, index, _, cx| match listed.get(index) {
+                        Some(playlist) => this.playlist_row(shelf, playlist, cx),
+                        None => div().into_any_element(),
+                    }),
+                ),
+            )
+            .into_any_element()
+    }
+
+    fn playlist_row(
+        &self,
+        shelf: Shelf,
+        playlist: &music::Playlist,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = *cx.theme();
+        let accent = theme.sidebar_accent;
+        let id = playlist.id.clone();
+        let destination = Destination::Playlist(id.clone().into());
+        let active = self.trail.read(cx).current() == destination;
+        let hot = self.dropping_on.as_deref() == Some(playlist.id.as_str());
+        let editable = playlist.owned || playlist.collaborative;
+        let tint = match active {
+            true => theme.foreground,
+            false => theme.muted_foreground,
+        };
+        let button = named_row(
+            SharedString::from(format!("sidebar-playlist-{id}")),
+            playlist.name.clone().into(),
+            tint,
+            accent,
+        )
+        .icon("icons/list.svg")
+        .when(active || hot, |button| button.bg(accent))
+        .on_click({
+            let opened = destination.clone();
+            move |_, _, cx| navigate(opened.clone(), cx)
+        });
+
+        let hover_id = id.clone();
+        let drop_id = id.clone();
+        div()
+            .id(SharedString::from(format!("sidebar-playlist-drop-{id}")))
+            .w_full()
+            .min_w_0()
+            .child(button)
+            .on_drag_move(
+                cx.listener(move |this, event: &DragMoveEvent<DraggedPin>, _, cx| {
+                    this.hover_playlist(shelf, &hover_id, editable, event, cx);
+                }),
+            )
+            .on_drop(cx.listener(move |this, dragged: &DraggedPin, _, cx| {
+                this.drop_on_playlist(shelf, &drop_id, editable, dragged, cx);
+            }))
+            .into_any_element()
+    }
+
+    fn hover_playlist(
+        &mut self,
+        shelf: Shelf,
+        id: &str,
+        editable: bool,
+        event: &DragMoveEvent<DraggedPin>,
+        cx: &mut Context<Self>,
+    ) {
+        let dragged = event.drag(cx);
+        let same = self.session.read(cx).shelf_for(&dragged.pin.id) == Some(shelf);
+        let hover = editable
+            && same
+            && dragged.pin.kind == PinKind::Song
+            && event.bounds.contains(&event.event.position);
+        match hover {
+            true if self.dropping_on.as_deref() != Some(id) => {
+                self.dropping_on = Some(id.to_owned());
+                cx.notify();
+            }
+            false if self.dropping_on.as_deref() == Some(id) => {
+                self.dropping_on = None;
+                cx.notify();
+            }
+            _ => {}
+        }
+    }
+
+    fn drop_on_playlist(
+        &mut self,
+        shelf: Shelf,
+        id: &str,
+        editable: bool,
+        dragged: &DraggedPin,
+        cx: &mut Context<Self>,
+    ) {
+        if !editable || dragged.pin.kind != PinKind::Song {
+            return;
+        }
+        if self.session.read(cx).shelf_for(&dragged.pin.id) != Some(shelf) {
+            return;
+        }
+        let track = dragged.pin.id.clone();
+        let playlist = id.to_owned();
+        self.library.update(cx, |library, cx| {
+            library.add_to_playlist(playlist, track, cx);
+        });
+    }
+
     fn persist(&self, cx: &mut Context<Self>) {
         let width = self.width / px(1.);
         let open = self.open;
@@ -733,15 +956,16 @@ impl Render for SidebarLeft {
         let sidebar_border = theme.sidebar_border;
 
         let current = self.trail.read(cx).current();
-        self.follow(&current);
+        self.follow(&current, cx);
         self.adapt(super::Chrome::reserved_right(cx), window, cx);
 
         if !cx.has_active_drag() {
             self.dropping = false;
             self.drop_gap = None;
+            self.dropping_on = None;
         }
 
-        let mut rows = self.navigation(cx);
+        let mut rows = self.navigation(window, cx);
         rows.extend(self.pins(window, cx));
 
         let overlaid = self.overlays();
@@ -769,6 +993,9 @@ impl Render for SidebarLeft {
                 cx.notify();
             }))
             .on_drop(cx.listener(|this, dragged: &DraggedPin, _, cx| {
+                if this.dropping_on.is_some() {
+                    return;
+                }
                 let gap = this.drop_gap.take();
                 this.dropping = false;
                 let pin = dragged.pin.clone();
@@ -894,6 +1121,25 @@ fn expanded(current: &Destination) -> (Option<&str>, bool) {
         Destination::Library { account, .. } => (Some(account.as_ref()), false),
         Destination::Local(_) => (None, true),
         _ => (None, false),
+    }
+}
+
+fn shelf_key(shelf: Shelf) -> &'static str {
+    match shelf {
+        Shelf::Account(slug) => slug,
+        Shelf::Local => "local",
+        Shelf::Rekordbox => "rekordbox",
+    }
+}
+
+fn shelf_destination(shelf: Shelf, tab: LibraryTab) -> Destination {
+    match shelf {
+        Shelf::Account(slug) => Destination::Library {
+            account: slug.into(),
+            tab,
+        },
+        Shelf::Local => Destination::Local(tab),
+        Shelf::Rekordbox => Destination::Rekordbox(tab),
     }
 }
 
