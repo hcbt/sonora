@@ -450,6 +450,9 @@ impl Pins {
         if session.local_client().is_some() {
             shelves.push(Shelf::Local);
         }
+        if session.rekordbox_client().is_some() {
+            shelves.push(Shelf::Rekordbox);
+        }
         shelves
     }
 

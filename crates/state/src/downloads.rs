@@ -255,7 +255,7 @@ impl Downloads {
             }
             SessionEvent::SignedOut(_) => this.clear(cx),
             SessionEvent::WentOffline => this.halt(cx),
-            SessionEvent::LocalChanged => {}
+            SessionEvent::LocalChanged | SessionEvent::RekordboxChanged => {}
         })
         .detach();
         // A run that starts offline never signs in, but its downloads are still listed.

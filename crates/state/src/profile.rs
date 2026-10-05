@@ -44,7 +44,9 @@ impl Profile {
                     cx.notify();
                 }
             }
-            SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
+            SessionEvent::WentOffline
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

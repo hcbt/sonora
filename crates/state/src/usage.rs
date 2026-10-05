@@ -89,8 +89,11 @@ impl Usage {
     ) -> Self {
         cx.subscribe(&session, |this, _, event, cx| match event {
             SessionEvent::SignedIn(_) => this.connected(cx),
-            SessionEvent::Reconnected(_) | SessionEvent::SignedOut(_) | SessionEvent::WentOffline
-            | SessionEvent::LocalChanged => {}
+            SessionEvent::Reconnected(_)
+            | SessionEvent::SignedOut(_)
+            | SessionEvent::WentOffline
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

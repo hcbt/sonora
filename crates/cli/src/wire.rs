@@ -129,6 +129,8 @@ pub enum OriginKind {
     Liked,
     /// The local library.
     Local,
+    /// The rekordbox library.
+    Rekordbox,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

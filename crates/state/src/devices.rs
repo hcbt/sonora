@@ -99,6 +99,7 @@ impl Devices {
             | SessionEvent::SignedOut(_)
             | SessionEvent::Reconnected(_)
             | SessionEvent::WentOffline => this.relink(cx),
+            SessionEvent::RekordboxChanged => {}
         })
         .detach();
         cx.observe(&playback, |this, _, cx| this.publish(cx))

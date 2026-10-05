@@ -74,6 +74,7 @@ const STORAGE_POLL: Duration = Duration::from_secs(2);
 enum Slot {
     Accounts,
     LocalFolder,
+    RekordboxFolder,
     Folders,
     Theme,
     Adaptive,
@@ -727,6 +728,17 @@ impl SettingsView {
                     false => SharedString::default(),
                 },
             ),
+            Slot::RekordboxFolder => (
+                t!("settings-rekordbox-folder"),
+                self.session
+                    .read(cx)
+                    .rekordbox_error()
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| match self.session.read(cx).rekordbox_path().is_some() {
+                        true => t!("settings-rekordbox-folder-detail"),
+                        false => t!("settings-rekordbox-folder-empty"),
+                    }),
+            ),
             Slot::Theme => (t!("settings-theme"), t!("settings-theme-detail")),
             Slot::Adaptive => (t!("settings-adaptive"), t!("settings-adaptive-detail")),
             Slot::CommunityThemes => (
@@ -974,6 +986,7 @@ impl SettingsView {
             Slot::TrayIcon => self.tray_icon_row(cx),
             Slot::Accounts => div().into_any_element(),
             Slot::LocalFolder => self.local_folder_row(cx),
+            Slot::RekordboxFolder => self.rekordbox_folder_row(cx),
             Slot::Folders => self.folders(cx),
             Slot::Theme | Slot::Icons | Slot::Corners => div().into_any_element(),
             Slot::Adaptive => self.adaptive_row(cx),

@@ -486,6 +486,9 @@ struct Values {
     startup: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     local_folders: Vec<PathBuf>,
+    /// The rekordbox master-database directory, or the `master.db` file itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rekordbox_folder: Option<PathBuf>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     hidden_nav: Vec<String>,
     /// Missing system requirements the user asked never to hear about again.
@@ -693,6 +696,7 @@ impl Default for Values {
             font: system_font(),
             startup: DEFAULT_STARTUP.to_owned(),
             local_folders: Vec::new(),
+            rekordbox_folder: None,
             hidden_nav: Vec::new(),
             silenced_requirements: Vec::new(),
             scrobbling: BTreeMap::new(),
@@ -1329,6 +1333,10 @@ impl AppSettings {
         &self.values.local_folders
     }
 
+    pub fn rekordbox_folder(&self) -> Option<&PathBuf> {
+        self.values.rekordbox_folder.as_ref()
+    }
+
     pub fn startup(&self) -> &str {
         &self.values.startup
     }
@@ -1618,6 +1626,14 @@ impl AppSettings {
             return;
         }
         self.values.local_folders = folders;
+        self.schedule_save(cx);
+    }
+
+    pub fn set_rekordbox_folder(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        if self.values.rekordbox_folder == folder {
+            return;
+        }
+        self.values.rekordbox_folder = folder;
         self.schedule_save(cx);
     }
 

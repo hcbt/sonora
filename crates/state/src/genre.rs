@@ -56,7 +56,9 @@ impl Genres {
                 this.dressing = None;
                 this.drop_account(slug, cx);
             }
-            SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
+            SessionEvent::WentOffline
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 
@@ -330,7 +332,9 @@ impl GenreDetails {
                     cx.notify();
                 }
             }
-            SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
+            SessionEvent::WentOffline
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

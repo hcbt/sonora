@@ -166,7 +166,10 @@ impl Search {
                 this.query.clear();
                 this.ask(&pending, cx);
             }
-            SessionEvent::Reconnected(_) | SessionEvent::WentOffline | SessionEvent::LocalChanged => {}
+            SessionEvent::Reconnected(_)
+            | SessionEvent::WentOffline
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 
@@ -488,6 +491,12 @@ impl Search {
             }
             if session.local_client().is_some() {
                 let state = held.state(Shelf::Local);
+                tracks.extend(state.tracks().iter().cloned());
+                albums.extend(state.albums().iter().cloned());
+                playlists.extend(state.playlists().iter().cloned());
+            }
+            if session.rekordbox_client().is_some() {
+                let state = held.state(Shelf::Rekordbox);
                 tracks.extend(state.tracks().iter().cloned());
                 albums.extend(state.albums().iter().cloned());
                 playlists.extend(state.playlists().iter().cloned());

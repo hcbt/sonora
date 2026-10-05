@@ -32,11 +32,13 @@ const PIN_POLL: Duration = Duration::from_secs(60);
 static READS: Semaphore = Semaphore::const_new(4);
 
 /// Which library a page, an id or a playlist belongs to. Each signed-in account is its own
-/// shelf; the local shelf follows the imported folders.
+/// shelf; the local shelf follows the imported folders, and the rekordbox shelf follows the
+/// configured master database.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Shelf {
     Account(&'static str),
     Local,
+    Rekordbox,
 }
 
 impl Shelf {
@@ -44,10 +46,14 @@ impl Shelf {
         matches!(self, Self::Local)
     }
 
+    pub fn rekordbox(self) -> bool {
+        matches!(self, Self::Rekordbox)
+    }
+
     pub fn slug(self) -> Option<&'static str> {
         match self {
             Self::Account(slug) => Some(slug),
-            Self::Local => None,
+            Self::Local | Self::Rekordbox => None,
         }
     }
 
@@ -56,13 +62,14 @@ impl Shelf {
         match self {
             Self::Account(slug) => slug,
             Self::Local => "local",
+            Self::Rekordbox => "rekordbox",
         }
     }
 
     /// The parts whose joint failure marks the whole shelf failed, rather than one problem.
     fn fatal(self) -> &'static [LibraryPart] {
         match self {
-            Self::Account(_) => &FATAL,
+            Self::Account(_) | Self::Rekordbox => &FATAL,
             Self::Local => &FATAL_LOCAL,
         }
     }
@@ -1230,6 +1237,13 @@ impl Library {
                     }
                 }
             }
+            SessionEvent::RekordboxChanged => match session.read(cx).client_of(Shelf::Rekordbox) {
+                Some(_) => this.load(Shelf::Rekordbox, cx),
+                None => {
+                    this.shelves.remove(&Shelf::Rekordbox);
+                    cx.notify();
+                }
+            },
         })
         .detach();
         // An account kept offline never signs in, whether at launch or after a switch, so its shelf
@@ -1280,6 +1294,7 @@ impl Library {
             raised_rows: HashMap::new(),
         };
         library.held_mut(Shelf::Local).shape = Shape::Catalog(Catalog::Fixed);
+        library.held_mut(Shelf::Rekordbox).shape = Shape::Catalog(Catalog::Fixed);
         for slug in stored {
             library.held_mut(Shelf::Account(slug)).state = LibraryState::Loading;
             library.prime(Shelf::Account(slug), cx);
@@ -1287,6 +1302,15 @@ impl Library {
         match library.session.read(cx).client_of(Shelf::Local).is_some() {
             true => library.load(Shelf::Local, cx),
             false => library.prime(Shelf::Local, cx),
+        }
+        match library
+            .session
+            .read(cx)
+            .client_of(Shelf::Rekordbox)
+            .is_some()
+        {
+            true => library.load(Shelf::Rekordbox, cx),
+            false => library.prime(Shelf::Rekordbox, cx),
         }
         library
     }
@@ -1303,6 +1327,12 @@ impl Library {
                 let session = self.session.read(cx);
                 (!session.local_paths().is_empty()).then(|| session.local_slug())
             }
+            Shelf::Rekordbox => self
+                .session
+                .read(cx)
+                .rekordbox_path()
+                .is_some()
+                .then_some("rekordbox"),
         };
         let Some(provider) = provider else {
             return;
@@ -1419,6 +1449,7 @@ impl Library {
         match shelf {
             Shelf::Account(slug) => Some(slug),
             Shelf::Local => Some(self.session.read(cx).local_slug()),
+            Shelf::Rekordbox => Some("rekordbox"),
         }
     }
 
@@ -1559,14 +1590,16 @@ impl Library {
     }
 
     fn shelf_of(&self, id: &str) -> Shelf {
-        match music::is_local_id(id) {
-            true => Shelf::Local,
-            false => self
-                .owned
-                .slug(id)
-                .map(Shelf::Account)
-                .unwrap_or(Shelf::Account("")),
+        if music::is_local_id(id) {
+            return Shelf::Local;
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return Shelf::Rekordbox;
+        }
+        self.owned
+            .slug(id)
+            .map(Shelf::Account)
+            .unwrap_or(Shelf::Account(""))
     }
 
     pub fn state(&self, shelf: Shelf) -> &LibraryState {
@@ -1604,6 +1637,10 @@ impl Library {
             .iter()
             .find(|problem| problem.part == part)
             .map(|problem| problem.reason.as_str())
+    }
+    pub fn set_rekordbox_folder(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.session
+            .update(cx, |session, cx| session.set_rekordbox_folder(folder, cx));
     }
 
     pub fn add_local_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -3184,6 +3221,7 @@ impl Library {
                 return;
             }
             Shelf::Local => {}
+            Shelf::Rekordbox => {}
         }
         self.load(shelf, cx);
     }

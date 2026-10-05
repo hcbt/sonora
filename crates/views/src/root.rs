@@ -48,6 +48,7 @@ struct Screens {
     history: Entity<HistoryView>,
     libraries: HashMap<String, Entity<LibraryView>>,
     local: Entity<LibraryView>,
+    rekordbox: Entity<LibraryView>,
     artist: Option<Entity<ArtistView>>,
     artist_detail: Option<Entity<ArtistDetail>>,
     album: Option<Entity<DetailView>>,
@@ -224,6 +225,16 @@ impl Root {
             )
         });
 
+        let rekordbox_view = cx.new(|cx| {
+            LibraryView::new(
+                Shelf::Rekordbox,
+                library.clone(),
+                playback.clone(),
+                crate::shared::cells::content_width(window, gpui::px(0.), cx),
+                cx,
+            )
+        });
+
         let io = Io::global(cx);
         let home_state = cx.new(|cx| Home::new(library.clone(), session.clone(), io.clone(), cx));
         let home = cx.new(|cx| HomeView::new(home_state, playback.clone(), cx));
@@ -358,6 +369,7 @@ impl Root {
                 history,
                 libraries: HashMap::new(),
                 local: local_view,
+                rekordbox: rekordbox_view,
                 artist: None,
                 artist_detail: None,
                 album: None,
@@ -697,6 +709,7 @@ impl Root {
                     None => Box::new(|_| false),
                 }
             }
+            Destination::Rekordbox(_) => shelf(Shelf::Rekordbox),
             Destination::Local(_) => {
                 let session = Sonora::global(cx).session.clone();
                 let local = shelf(Shelf::Local);
@@ -753,6 +766,9 @@ impl Root {
                 if let Some(slug) = slug {
                     library.update(cx, |library, cx| library.reload(Shelf::Account(slug), cx));
                 }
+            }
+            Destination::Rekordbox(_) => {
+                library.update(cx, |library, cx| library.reload(Shelf::Rekordbox, cx))
             }
             Destination::Local(_) => {
                 library.update(cx, |library, cx| library.reload(Shelf::Local, cx))
@@ -1011,6 +1027,12 @@ impl Root {
                 local.update(cx, |local, cx| local.select(tab.into(), cx));
                 toolbar = Some(local.read(cx).toolbar());
                 local.into()
+            }
+            Destination::Rekordbox(tab) => {
+                let rekordbox = self.screens.rekordbox.clone();
+                rekordbox.update(cx, |rekordbox, cx| rekordbox.select(tab.into(), cx));
+                toolbar = Some(rekordbox.read(cx).toolbar());
+                rekordbox.into()
             }
             Destination::Library { account, tab } => {
                 let view = self.library_view(&account, cx);

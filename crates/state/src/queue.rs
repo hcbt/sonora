@@ -439,7 +439,8 @@ impl Queue {
             SessionEvent::SignedIn(_)
             | SessionEvent::Reconnected(_)
             | SessionEvent::WentOffline
-            | SessionEvent::LocalChanged => {}
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

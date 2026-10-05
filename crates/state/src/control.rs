@@ -744,6 +744,7 @@ fn wire_origin(origin: &Origin) -> wire::Origin {
         Whence::Radio => wire::OriginKind::Radio,
         Whence::Saved => wire::OriginKind::Liked,
         Whence::Local => wire::OriginKind::Local,
+        Whence::Rekordbox => wire::OriginKind::Rekordbox,
     };
     wire::Origin {
         kind,

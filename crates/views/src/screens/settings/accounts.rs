@@ -4,8 +4,8 @@ use std::time::Duration;
 use gpui::accesskit::{Role, Toggled};
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, ClickEvent, Context, ElementId, FontWeight, Hsla, Pixels, SharedString,
-    Window, div, px, relative, svg,
+    AnyElement, App, ClickEvent, Context, ElementId, FontWeight, Hsla, PathPromptOptions, Pixels,
+    SharedString, Window, div, px, relative, svg,
 };
 use i18n::t;
 use music::{AccountChoice, SignIn, SignInPrompt};
@@ -16,7 +16,7 @@ use ui::{
     Theme, mix,
 };
 
-use super::rows::drill;
+use super::rows::{Row, drill};
 use super::{Group, SettingsView, Slot};
 use crate::shared::device_code::device_code;
 use crate::shared::local;
@@ -72,7 +72,7 @@ impl SettingsView {
         vec![
             Group::new("settings-group-services", "icons/music.svg").cards(Slot::Accounts),
             Group::new("settings-group-local-files", "icons/file-music.svg")
-                .rows([Slot::LocalFolder]),
+                .rows([Slot::LocalFolder, Slot::RekordboxFolder]),
         ]
     }
 
@@ -155,6 +155,97 @@ impl SettingsView {
         )
         .on_click(|_, _, cx| navigate(Destination::Settings(SettingsPage::MusicFolders), cx))
         .into_any_element()
+    }
+
+    /// The rekordbox library folder: choose, reload or remove it, with the path shown below.
+    pub(super) fn rekordbox_folder_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = *cx.theme();
+        let muted = theme.muted_foreground;
+        let small = theme.text(Text::Small);
+        let path = self.session.read(cx).rekordbox_path();
+        let choose = Button::new("choose-rekordbox-folder")
+            .label(t!("settings-choose-folder"))
+            .icon("icons/folder-plus.svg")
+            .small()
+            .outline()
+            .on_click(|_, _, cx| choose_rekordbox_folder(cx));
+        let reload = path.is_some().then(|| {
+            Button::new("reload-rekordbox")
+                .label(t!("settings-rekordbox-reload"))
+                .small()
+                .ghost()
+                .on_click(|_, _, cx| {
+                    let library = Sonora::global(cx).library.clone();
+                    let path = Sonora::global(cx).session.read(cx).rekordbox_path();
+                    let Some(path) = path else {
+                        return;
+                    };
+                    library.update(cx, |library, cx| {
+                        library.set_rekordbox_folder(Some(PathBuf::from(path)), cx)
+                    });
+                })
+        });
+        let detail = self
+            .session
+            .read(cx)
+            .rekordbox_error()
+            .map(SharedString::from)
+            .unwrap_or_else(|| match path.is_some() {
+                true => t!("settings-rekordbox-folder-detail"),
+                false => t!("settings-rekordbox-folder-empty"),
+            });
+        let header = Row::new(
+            t!("settings-rekordbox-folder"),
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(choose)
+                .children(reload)
+                .into_any_element(),
+        )
+        .detail(detail);
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(header)
+            .when_some(path, |row, path| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .pb_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(muted)
+                                .text_size(small)
+                                .child(SharedString::from(path)),
+                        )
+                        .child(
+                            Button::new("remove-rekordbox-folder")
+                                .ghost()
+                                .small()
+                                .icon("icons/x.svg")
+                                .tooltip("settings-remove-folder")
+                                .tint(muted)
+                                .on_click(|_, _, cx| {
+                                    let library = Sonora::global(cx).library.clone();
+                                    library.update(cx, |library, cx| {
+                                        library.set_rekordbox_folder(None, cx)
+                                    });
+                                }),
+                        ),
+                )
+            })
+            .into_any_element()
     }
 
     /// The music folders page's list: one row per watched folder with its remove button, then
@@ -1107,4 +1198,27 @@ pub(super) fn account_error(error: &Failure, cx: &App) -> impl IntoElement {
                 .text_color(theme.muted_foreground)
                 .child(crate::shared::trouble::short(error)),
         )
+}
+
+/// Asks for the folder that holds a rekordbox library and hands it to the session.
+fn choose_rekordbox_folder(cx: &mut App) {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: None,
+    });
+    let library = Sonora::global(cx).library.clone();
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = receiver.await else {
+            return;
+        };
+        let Some(path) = paths.into_iter().next() else {
+            return;
+        };
+        library.update(cx, |library, cx| {
+            library.set_rekordbox_folder(Some(path), cx)
+        });
+    })
+    .detach();
 }
