@@ -148,6 +148,10 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 serde_norway = "0.9"
 sha2 = "0.10"
+aes = "0.9.3"
+hmac = "0.13.0"
+pbkdf2 = { version = "0.13.0", features = ["sha2"] }
+sha1 = "0.11.0"
 souvlaki = "0.8"
 sys-locale = "0.3"
 symphonia = { version = "0.5.5", default-features = false, features = ["mkv", "ogg", "isomp4"] }

@@ -23,16 +23,18 @@ pub enum NavEntry {
     Library,
     History,
     Local,
+    Rekordbox,
     Pins,
 }
 
 impl NavEntry {
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Home,
         Self::Search,
         Self::Library,
         Self::History,
         Self::Local,
+        Self::Rekordbox,
         Self::Pins,
     ];
 
@@ -43,6 +45,7 @@ impl NavEntry {
             Self::Library => "library",
             Self::History => "history",
             Self::Local => "local",
+            Self::Rekordbox => "rekordbox",
             Self::Pins => "sidebar-pins",
         }
     }
@@ -54,6 +57,7 @@ impl NavEntry {
             Self::Library => "nav-library",
             Self::History => "nav-history",
             Self::Local => "nav-local",
+            Self::Rekordbox => "nav-rekordbox",
             Self::Pins => "nav-pinned",
         }
     }
@@ -230,6 +234,7 @@ pub enum Destination {
         tab: LibraryTab,
     },
     Local(LibraryTab),
+    Rekordbox(LibraryTab),
     Album(SharedString),
     Song(SharedString),
     Playlist(SharedString),
@@ -261,6 +266,7 @@ impl Destination {
                 Destination::Library { account: right, .. },
             ) if left == right => true,
             (Destination::Local(_), Destination::Local(_))
+            | (Destination::Rekordbox(_), Destination::Rekordbox(_))
             | (Destination::Settings(_), Destination::Settings(_)) => true,
             _ => self == other,
         }

@@ -27,7 +27,8 @@ impl Cover {
             SessionEvent::SignedOut(slug) => this.forget(slug, cx),
             SessionEvent::SignedIn(_)
             | SessionEvent::Reconnected(_)
-            | SessionEvent::LocalChanged => {}
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

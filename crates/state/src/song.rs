@@ -50,6 +50,16 @@ impl SongDetail {
                     this.open(&id, cx);
                 }
             }
+            SessionEvent::RekordboxChanged => {
+                if let Some(id) = this
+                    .id
+                    .clone()
+                    .filter(|id| music::rekordbox::is_rekordbox_id(id))
+                {
+                    this.clear();
+                    this.open(&id, cx);
+                }
+            }
         })
         .detach();
         Self {

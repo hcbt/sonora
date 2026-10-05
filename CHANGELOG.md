@@ -13,6 +13,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Press F11 or double-click the fullscreen view to make the window fill the whole screen. Turn on
   Use OS fullscreen in settings to have the fullscreen button do the same.
+- Play a rekordbox library, including its playlists. Set the library folder under Settings,
+  next to your music folders.
 - Spotify, YouTube Music and the other accounts can stay signed in together. Each one has its
   own library in the sidebar, next to Local Music, and search, home and playback use whichever
   account the song belongs to.

@@ -6,6 +6,7 @@
 
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
+use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
@@ -85,7 +86,7 @@ impl Fetch for Local {
 /// A file read from `skip` on, with every position counted from there, so the decoder never
 /// sees the ID3v2 tag in front of the audio. A seek back to the first frame then lands on that
 /// frame, not inside the tag, where a cover picture can pass for a frame header.
-struct Audio {
+pub(crate) struct Audio {
     file: File,
     skip: u64,
 }
@@ -106,10 +107,9 @@ impl Seek for Audio {
     }
 }
 
-/// Opens a local file and builds its decoder.
-fn decode(id: &str) -> Result<rodio::Decoder<BufReader<Audio>>> {
-    let path =
-        wire::path_from_track_id(id).ok_or_else(|| anyhow!("{id} is not a local track id"))?;
+/// Opens `path` and builds its decoder. Rekordbox playback uses the same reader: the file is
+/// the file, whichever library named it.
+pub(crate) fn decode_path(path: &Path) -> Result<rodio::Decoder<BufReader<Audio>>> {
     let mut file =
         std::fs::File::open(path).with_context(|| format!("cannot open {}", path.display()))?;
     let length = file.metadata().ok().map(|meta| meta.len());
@@ -130,4 +130,11 @@ fn decode(id: &str) -> Result<rodio::Decoder<BufReader<Audio>>> {
         builder = builder.with_byte_len(length.saturating_sub(skip));
     }
     builder.build().context("cannot decode audio")
+}
+
+/// Opens a local file and builds its decoder.
+fn decode(id: &str) -> Result<rodio::Decoder<BufReader<Audio>>> {
+    let path =
+        wire::path_from_track_id(id).ok_or_else(|| anyhow!("{id} is not a local track id"))?;
+    decode_path(path)
 }

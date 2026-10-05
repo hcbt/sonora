@@ -12,7 +12,7 @@ use crate::shared::text;
 use crate::shared::veil::{Edge, veil};
 use gpui::{
     AnyElement, App, ClickEvent, Context, Entity, FocusHandle, FontWeight, MouseButton,
-    MouseUpEvent, Pixels, Render, SharedString, Task, Window, div, px, relative,
+    MouseUpEvent, PathPromptOptions, Pixels, Render, SharedString, Task, Window, div, px, relative,
 };
 use gpui::{ScrollHandle, prelude::*, svg};
 use i18n::{Language, t};
@@ -129,6 +129,7 @@ enum Slot {
     TrayIcon,
     Accounts,
     LocalFolder,
+    RekordboxFolder,
     Theme,
     Adaptive,
     Ambient,
@@ -554,6 +555,7 @@ impl SettingsView {
                 Slot::Accounts,
                 Slot::Title("settings-group-library"),
                 Slot::LocalFolder,
+                Slot::RekordboxFolder,
             ],
             SettingsTab::Appearance => vec![
                 Slot::Title("settings-tab-general"),
@@ -683,6 +685,17 @@ impl SettingsView {
                     true => t!("settings-local-folder-empty"),
                     false => SharedString::default(),
                 },
+            ),
+            Slot::RekordboxFolder => (
+                t!("settings-rekordbox-folder"),
+                self.session
+                    .read(cx)
+                    .rekordbox_error()
+                    .map(SharedString::from)
+                    .unwrap_or_else(|| match self.session.read(cx).rekordbox_path().is_some() {
+                        true => t!("settings-rekordbox-folder-detail"),
+                        false => t!("settings-rekordbox-folder-empty"),
+                    }),
             ),
             Slot::Theme => (t!("settings-theme"), t!("settings-theme-detail")),
             Slot::Adaptive => (t!("settings-adaptive"), t!("settings-adaptive-detail")),
@@ -856,6 +869,7 @@ impl SettingsView {
             Slot::Sep => SEPARATOR_HEIGHT,
             Slot::Accounts => snapped(self.accounts_height(&theme, cx), window),
             Slot::LocalFolder => snapped(self.local_height(&theme, cx), window),
+            Slot::RekordboxFolder => snapped(self.rekordbox_height(&theme, cx), window),
             Slot::EqualizerBands => snapped(
                 SECTION_GAP
                     + line(&theme, Text::Tiny)
@@ -940,6 +954,7 @@ impl SettingsView {
             Slot::TrayIcon => self.tray_icon_row(cx).element,
             Slot::Accounts => self.accounts_row(cx).element,
             Slot::LocalFolder => self.local_folder_row(cx).element,
+            Slot::RekordboxFolder => self.rekordbox_folder_row(cx).element,
             Slot::Theme => self.theme_row(cx).element,
             Slot::Adaptive => self.adaptive_row(cx).element,
             Slot::Ambient => self.ambient_row(cx).element,
@@ -3189,6 +3204,109 @@ impl SettingsView {
             });
     }
 
+    fn rekordbox_height(&self, theme: &Theme, cx: &App) -> Pixels {
+        let mut total = standard_height(theme);
+        if self.session.read(cx).rekordbox_path().is_some() {
+            total += theme.metrics.control_small + theme.metrics.pad;
+        }
+        total
+    }
+
+    fn rekordbox_folder_row(&self, cx: &mut Context<Self>) -> Setting {
+        let theme = *cx.theme();
+        let muted = theme.muted_foreground;
+        let small = theme.text(Text::Small);
+        let path = self.session.read(cx).rekordbox_path();
+        let choose = Button::new("choose-rekordbox-folder")
+            .label(t!("settings-choose-folder"))
+            .icon("icons/folder-plus.svg")
+            .small()
+            .outline()
+            .on_click(|_, _, cx| choose_rekordbox_folder(cx));
+        let reload = path.is_some().then(|| {
+            Button::new("reload-rekordbox")
+                .label(t!("settings-rekordbox-reload"))
+                .small()
+                .ghost()
+                .on_click(|_, _, cx| {
+                    let library = Sonora::global(cx).library.clone();
+                    let path = Sonora::global(cx).session.read(cx).rekordbox_path();
+                    let Some(path) = path else {
+                        return;
+                    };
+                    library.update(cx, |library, cx| {
+                        library.set_rekordbox_folder(Some(PathBuf::from(path)), cx)
+                    });
+                })
+        });
+        let Setting {
+            title,
+            detail,
+            element: header,
+        } = self.row(
+            t!("settings-rekordbox-folder"),
+            match path.is_some() {
+                true => t!("settings-rekordbox-folder-detail"),
+                false => t!("settings-rekordbox-folder-empty"),
+            },
+            muted,
+            small,
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(choose)
+                .children(reload)
+                .into_any_element(),
+        );
+        let element = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(header)
+            .when_some(path, |row, path| {
+                row.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_2()
+                        .pb_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .overflow_hidden()
+                                .whitespace_nowrap()
+                                .text_ellipsis()
+                                .text_color(muted)
+                                .text_size(small)
+                                .child(SharedString::from(path)),
+                        )
+                        .child(
+                            Button::new("remove-rekordbox-folder")
+                                .ghost()
+                                .small()
+                                .icon("icons/x.svg")
+                                .tooltip("settings-remove-folder")
+                                .tint(muted)
+                                .on_click(|_, _, cx| {
+                                    let library = Sonora::global(cx).library.clone();
+                                    library.update(cx, |library, cx| {
+                                        library.set_rekordbox_folder(None, cx)
+                                    });
+                                }),
+                        ),
+                )
+            })
+            .into_any_element();
+        Setting {
+            title,
+            detail,
+            element,
+        }
+    }
+
     /// One row per scrobbling service, in the order `music::scrobble` lists them.
     fn scrobble_slots(&self, cx: &App) -> Vec<Slot> {
         let services = self.scrobbling.read(cx).rows().len();
@@ -4643,6 +4761,28 @@ impl Render for SettingsHeader {
                     .child(div().flex().justify_center().child(categories)),
             )
     }
+}
+
+fn choose_rekordbox_folder(cx: &mut App) {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: None,
+    });
+    let library = Sonora::global(cx).library.clone();
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = receiver.await else {
+            return;
+        };
+        let Some(path) = paths.into_iter().next() else {
+            return;
+        };
+        library.update(cx, |library, cx| {
+            library.set_rekordbox_folder(Some(path), cx)
+        });
+    })
+    .detach();
 }
 
 fn usable_fonts(text_system: std::sync::Arc<gpui::TextSystem>) -> Vec<SharedString> {

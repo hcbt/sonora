@@ -80,6 +80,8 @@ pub enum SessionEvent {
     SignedOut(&'static str),
     Reconnected(&'static str),
     LocalChanged,
+    /// The rekordbox library was opened, closed, or failed to open.
+    RekordboxChanged,
 }
 
 #[derive(Clone, Copy)]
@@ -152,6 +154,13 @@ pub struct Session {
     local_task: Option<Task<()>>,
     /// Whether a local scan is under way, so the UI can show its progress.
     scanning: bool,
+    rekordbox_folder: Option<PathBuf>,
+    rekordbox_client: Option<Arc<dyn MusicApi>>,
+    rekordbox_catalog: Option<Arc<CatalogSource>>,
+    rekordbox_playback: Option<Arc<dyn PlaybackFactory>>,
+    rekordbox_task: Option<Task<()>>,
+    /// Set when the configured folder could not be opened, so the library page can say why.
+    rekordbox_error: Option<String>,
 }
 
 impl EventEmitter<SessionEvent> for Session {}
@@ -165,6 +174,7 @@ impl Session {
         cx: &mut Context<Self>,
     ) -> Self {
         let local_folders = settings.read(cx).local_folders().to_vec();
+        let rekordbox_folder = settings.read(cx).rekordbox_folder().cloned();
         let local_playback = local_provider.playback_factory();
         let mut session = Self {
             state: SessionState::SignedOut,
@@ -192,8 +202,15 @@ impl Session {
             local_capabilities: Capabilities::NONE,
             local_task: None,
             scanning: false,
+            rekordbox_folder,
+            rekordbox_client: None,
+            rekordbox_catalog: None,
+            rekordbox_playback: None,
+            rekordbox_task: None,
+            rekordbox_error: None,
         };
         session.restore_local(cx);
+        session.restore_rekordbox(cx);
         session
     }
 
@@ -218,23 +235,27 @@ impl Session {
     }
 
     pub fn client_for(&self, id: &str) -> Option<Arc<dyn MusicApi>> {
-        match music::is_local_id(id) {
-            true => self.local_client.clone(),
-            false => self
-                .slug_for(id)
-                .and_then(|slug| self.live(slug))
-                .map(|live| live.client.clone()),
+        if music::is_local_id(id) {
+            return self.local_client.clone();
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return self.rekordbox_client.clone();
+        }
+        self.slug_for(id)
+            .and_then(|slug| self.live(slug))
+            .map(|live| live.client.clone())
     }
 
     pub fn playback_for(&self, id: &str) -> Option<Arc<dyn PlaybackFactory>> {
-        match music::is_local_id(id) {
-            true => self.local_playback.clone(),
-            false => self
-                .slug_for(id)
-                .and_then(|slug| self.live(slug))
-                .map(|live| live.playback.clone()),
+        if music::is_local_id(id) {
+            return self.local_playback.clone();
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return self.rekordbox_playback.clone();
+        }
+        self.slug_for(id)
+            .and_then(|slug| self.live(slug))
+            .map(|live| live.playback.clone())
     }
 
     pub fn playback_of(&self, slug: &str) -> Option<Arc<dyn PlaybackFactory>> {
@@ -250,28 +271,31 @@ impl Session {
         match shelf {
             Shelf::Account(slug) => self.live(slug).map(|live| live.client.clone()),
             Shelf::Local => self.local_client.clone(),
+            Shelf::Rekordbox => self.rekordbox_client.clone(),
         }
     }
 
-    /// What a shelf's library is made of. The local shelf is always a catalog.
+    /// What a shelf's library is made of. File libraries are catalogs.
     pub fn shape_of(&self, shelf: Shelf) -> Shape {
         match shelf {
             Shelf::Account(slug) => self
                 .live(slug)
                 .map(|live| live.shape)
                 .unwrap_or(Shape::Saved),
-            Shelf::Local => Shape::Catalog,
+            Shelf::Local | Shelf::Rekordbox => Shape::Catalog,
         }
     }
 
     pub(crate) fn catalog(&self, id: &str) -> Option<Arc<CatalogSource>> {
-        match music::is_local_id(id) {
-            true => self.local_catalog.clone(),
-            false => self
-                .slug_for(id)
-                .and_then(|slug| self.live(slug))
-                .map(|live| live.catalog.clone()),
+        if music::is_local_id(id) {
+            return self.local_catalog.clone();
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return self.rekordbox_catalog.clone();
+        }
+        self.slug_for(id)
+            .and_then(|slug| self.live(slug))
+            .map(|live| live.catalog.clone())
     }
 
     pub fn local_playback(&self) -> Option<Arc<dyn PlaybackFactory>> {
@@ -424,17 +448,23 @@ impl Session {
     }
 
     pub fn slug_for(&self, id: &str) -> Option<&'static str> {
-        match music::is_local_id(id) {
-            true => Some(self.local_slug()),
-            false => self.owned.slug(id),
+        if music::is_local_id(id) {
+            return Some(self.local_slug());
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return Some("rekordbox");
+        }
+        self.owned.slug(id)
     }
 
     pub fn shelf_for(&self, id: &str) -> Option<Shelf> {
-        match music::is_local_id(id) {
-            true => Some(Shelf::Local),
-            false => self.owned.slug(id).map(Shelf::Account),
+        if music::is_local_id(id) {
+            return Some(Shelf::Local);
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return Some(Shelf::Rekordbox);
+        }
+        self.owned.slug(id).map(Shelf::Account)
     }
 
     /// The provider an id belongs to, whichever library it sits in.
@@ -465,14 +495,16 @@ impl Session {
 
     /// What the account an id belongs to can do. Local files keep favorites but seed no station.
     pub fn capabilities_for(&self, id: &str) -> Capabilities {
-        match music::is_local_id(id) {
-            true => self.local_capabilities,
-            false => self
-                .slug_for(id)
-                .and_then(|slug| self.live(slug))
-                .map(|live| live.capabilities)
-                .unwrap_or(Capabilities::NONE),
+        if music::is_local_id(id) {
+            return self.local_capabilities;
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return rekordbox_capabilities();
+        }
+        self.slug_for(id)
+            .and_then(|slug| self.live(slug))
+            .map(|live| live.capabilities)
+            .unwrap_or(Capabilities::NONE)
     }
 
     /// The same, for whichever shelf a thing belongs to.
@@ -483,6 +515,7 @@ impl Session {
                 .map(|live| live.capabilities)
                 .unwrap_or(Capabilities::NONE),
             Shelf::Local => self.local_capabilities,
+            Shelf::Rekordbox => rekordbox_capabilities(),
         }
     }
 
@@ -1074,6 +1107,80 @@ impl Session {
         cx.notify();
         cx.emit(SessionEvent::LocalChanged);
     }
+
+    pub fn rekordbox_path(&self) -> Option<String> {
+        self.rekordbox_folder
+            .as_ref()
+            .map(|path| path.display().to_string())
+    }
+
+    pub fn rekordbox_error(&self) -> Option<&str> {
+        self.rekordbox_error.as_deref()
+    }
+
+    pub fn rekordbox_client(&self) -> Option<Arc<dyn MusicApi>> {
+        self.rekordbox_client.clone()
+    }
+
+    pub fn rekordbox_playback(&self) -> Option<Arc<dyn PlaybackFactory>> {
+        self.rekordbox_playback.clone()
+    }
+
+    /// Points the rekordbox library at `folder`. `None` closes it. The path is kept even when
+    /// the database cannot be opened, so a drive that is unplugged comes back on the next launch.
+    pub fn set_rekordbox_folder(&mut self, folder: Option<PathBuf>, cx: &mut Context<Self>) {
+        self.rekordbox_folder = folder.clone();
+        self.settings
+            .update(cx, |settings, cx| settings.set_rekordbox_folder(folder, cx));
+        self.open_rekordbox(cx);
+    }
+
+    fn restore_rekordbox(&mut self, cx: &mut Context<Self>) {
+        if self.rekordbox_folder.is_some() {
+            self.open_rekordbox(cx);
+        }
+    }
+
+    fn open_rekordbox(&mut self, cx: &mut Context<Self>) {
+        let Some(folder) = self.rekordbox_folder.clone() else {
+            self.rekordbox_client = None;
+            self.rekordbox_catalog = None;
+            self.rekordbox_playback = None;
+            self.rekordbox_error = None;
+            self.rekordbox_task = None;
+            cx.notify();
+            cx.emit(SessionEvent::RekordboxChanged);
+            return;
+        };
+
+        let io = self.io.clone();
+        self.rekordbox_error = None;
+        cx.notify();
+        self.rekordbox_task = Some(cx.spawn(async move |this, cx| {
+            let opened = join(io.spawn_blocking(move || music::rekordbox::open(&folder))).await;
+            this.update(cx, |this, cx| {
+                match opened {
+                    Ok(opened) => {
+                        this.rekordbox_catalog =
+                            Some(Arc::new(CatalogSource::new(opened.api.clone())));
+                        this.rekordbox_client = Some(opened.api);
+                        this.rekordbox_playback = Some(opened.playback);
+                        this.rekordbox_error = None;
+                    }
+                    Err(error) => {
+                        log::warn!("rekordbox: cannot open the library: {error:#}");
+                        this.rekordbox_client = None;
+                        this.rekordbox_catalog = None;
+                        this.rekordbox_playback = None;
+                        this.rekordbox_error = Some(error.to_string());
+                    }
+                }
+                cx.notify();
+                cx.emit(SessionEvent::RekordboxChanged);
+            })
+            .ok();
+        }));
+    }
 }
 
 /// Whether `a` and `b` are the same directory, or one contains the other — either way, scanning
@@ -1082,4 +1189,14 @@ fn overlaps(a: &Path, b: &Path) -> bool {
     let a = std::fs::canonicalize(a).unwrap_or_else(|_| a.to_path_buf());
     let b = std::fs::canonicalize(b).unwrap_or_else(|_| b.to_path_buf());
     a == b || a.starts_with(&b) || b.starts_with(&a)
+}
+
+fn rekordbox_capabilities() -> Capabilities {
+    Capabilities {
+        follow_artists: false,
+        radio: false,
+        playcounts: true,
+        library: false,
+        pins: false,
+    }
 }

@@ -9,6 +9,8 @@ mod tags;
 mod wire;
 
 pub use lyrics::LocalLyrics;
+pub(crate) use playback::{Audio, decode_path};
+pub(crate) use tags::loudness;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

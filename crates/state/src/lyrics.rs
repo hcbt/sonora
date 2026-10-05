@@ -260,7 +260,7 @@ impl Lyrics {
     /// Whether the services may be asked about this track, which a local file only allows when
     /// the user lets its metadata go online.
     fn online(&self, id: &str, cx: &Context<Self>) -> bool {
-        !music::is_local_id(id) || self.settings.read(cx).lyrics_for_local_files()
+        !music::plays_from_disk(id) || self.settings.read(cx).lyrics_for_local_files()
     }
 
     fn reads_file(&self, id: &str, cx: &Context<Self>) -> bool {

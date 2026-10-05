@@ -22,7 +22,7 @@ use crate::shared::menus::{ItemMenu, item_menu};
 /// The one drag list the pinned section keeps, so a pin dropped anywhere in it lands in order.
 const PINS: &str = "sidebar-pins";
 
-const NAV: [(Option<NavEntry>, &str, Destination); 6] = [
+const NAV: [(Option<NavEntry>, &str, Destination); 7] = [
     (Some(NavEntry::Home), "icons/house.svg", Destination::Home),
     (
         Some(NavEntry::Search),
@@ -38,6 +38,11 @@ const NAV: [(Option<NavEntry>, &str, Destination); 6] = [
         Some(NavEntry::Local),
         "icons/file-music.svg",
         Destination::Local(LibraryTab::Songs),
+    ),
+    (
+        Some(NavEntry::Rekordbox),
+        "icons/list-music.svg",
+        Destination::Rekordbox(LibraryTab::Songs),
     ),
     (
         Some(NavEntry::History),
@@ -71,12 +76,14 @@ const ROW_GAP: Pixels = px(4.);
 #[derive(Clone, Copy, PartialEq)]
 enum Group {
     Local,
+    Rekordbox,
 }
 
 impl Group {
     fn of(destination: &Destination) -> Option<Self> {
         match destination {
             Destination::Local(_) => Some(Self::Local),
+            Destination::Rekordbox(_) => Some(Self::Rekordbox),
             _ => None,
         }
     }
@@ -93,6 +100,7 @@ pub(crate) struct SidebarLeft {
     forced: Option<bool>,
     accounts_open: Vec<String>,
     local_open: bool,
+    rekordbox_open: bool,
     pinned_open: bool,
     dropping: bool,
     drop_gap: Option<usize>,
@@ -138,6 +146,7 @@ impl SidebarLeft {
             accounts_open.push(account.to_string());
         }
         let local_open = matches!(at, Destination::Local(_));
+        let rekordbox_open = matches!(at, Destination::Rekordbox(_));
 
         Self {
             settings,
@@ -150,6 +159,7 @@ impl SidebarLeft {
             cramped: false,
             accounts_open,
             local_open,
+            rekordbox_open,
             pinned_open,
             dropping: false,
             drop_gap: None,
@@ -172,6 +182,7 @@ impl SidebarLeft {
             self.open_account(account);
         }
         self.local_open |= matches!(current, Destination::Local(_));
+        self.rekordbox_open |= matches!(current, Destination::Rekordbox(_));
     }
 
     fn open_account(&mut self, slug: &str) {
@@ -368,12 +379,14 @@ impl SidebarLeft {
     fn opened(&self, group: Group) -> bool {
         match group {
             Group::Local => self.local_open,
+            Group::Rekordbox => self.rekordbox_open,
         }
     }
 
     fn flip(&mut self, group: Group) {
         let open = match group {
             Group::Local => &mut self.local_open,
+            Group::Rekordbox => &mut self.rekordbox_open,
         };
         *open = !*open;
     }
@@ -624,6 +637,15 @@ impl SidebarLeft {
             Group::Local => Tabs::new().items(LIBRARY_TABS.into_iter().enumerate().map(
                 |(slot, (name, tab_id))| {
                     tab(("local-tab", slot).into(), name, Destination::Local(tab_id))
+                },
+            )),
+            Group::Rekordbox => Tabs::new().items(LIBRARY_TABS.into_iter().enumerate().map(
+                |(slot, (name, tab_id))| {
+                    tab(
+                        ("rekordbox-tab", slot).into(),
+                        name,
+                        Destination::Rekordbox(tab_id),
+                    )
                 },
             )),
         }

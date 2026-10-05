@@ -22,7 +22,7 @@ impl Genres {
         cx.subscribe(&session, |this, _, event, cx| match event {
             SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) => this.reload(cx),
             SessionEvent::SignedOut(slug) => this.drop_account(slug, cx),
-            SessionEvent::LocalChanged => {}
+            SessionEvent::LocalChanged | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 
@@ -183,7 +183,7 @@ impl GenreDetails {
                     cx.notify();
                 }
             }
-            SessionEvent::LocalChanged => {}
+            SessionEvent::LocalChanged | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

@@ -1701,6 +1701,7 @@ impl Aside {
                 }
             }
             Whence::Local => Destination::Local(LibraryTab::Songs),
+            Whence::Rekordbox => Destination::Rekordbox(LibraryTab::Songs),
         };
         let name = match origin.whence {
             Whence::Saved => {
@@ -1714,6 +1715,7 @@ impl Aside {
             }
             Whence::Local => t!("nav-local"),
             Whence::Radio => t!("queue-from-radio", name = origin.name.as_deref()?),
+            Whence::Rekordbox => t!("nav-rekordbox"),
             Whence::Album | Whence::Playlist | Whence::Artist => origin.name.clone()?,
         };
 

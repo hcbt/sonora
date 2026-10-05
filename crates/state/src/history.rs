@@ -177,7 +177,7 @@ impl History {
         cx.subscribe(&session, |this, _, event, cx| match event {
             SessionEvent::SignedIn(_) | SessionEvent::Reconnected(_) => this.refresh(cx),
             SessionEvent::SignedOut(_) => this.refresh(cx),
-            SessionEvent::LocalChanged => {}
+            SessionEvent::LocalChanged | SessionEvent::RekordboxChanged => {}
         })
         .detach();
         cx.subscribe(&playback, |this, _, event, cx| match event {

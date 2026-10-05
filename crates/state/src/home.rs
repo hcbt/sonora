@@ -74,6 +74,7 @@ impl Home {
                     this.reload(cx);
                 }
             }
+            SessionEvent::RekordboxChanged => {}
             SessionEvent::Reconnected(_) => {}
         })
         .detach();

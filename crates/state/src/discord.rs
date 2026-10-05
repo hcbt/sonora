@@ -265,7 +265,7 @@ impl Discord {
         });
         let duration = track.duration.as_secs() as i64;
         let public_art = provider.is_some_and(|provider| provider.public_art());
-        let lookup = !track.id.as_deref().is_some_and(music::is_local_id)
+        let lookup = !track.id.as_deref().is_some_and(music::plays_from_disk)
             || settings.artwork_for_local_files();
         Shown::On(Box::new(Presence {
             source: named,

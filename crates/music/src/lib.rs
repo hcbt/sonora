@@ -19,6 +19,7 @@ pub mod musixmatch;
 pub mod netease;
 pub mod potoken;
 pub mod progress;
+pub mod rekordbox;
 pub mod scrobble;
 mod sink;
 mod spectrum;
@@ -67,6 +68,11 @@ pub fn is_local_id(id: &str) -> bool {
         || id.starts_with(LOCAL_PLAYLIST_PREFIX)
 }
 
+/// Whether `id` names a file on disk rather than a stream. Local files and a rekordbox library
+/// both do: playback opens the path, and a cover is a file, not a URL another service can fetch.
+pub fn plays_from_disk(id: &str) -> bool {
+    is_local_id(id) || rekordbox::is_rekordbox_id(id)
+}
 pub fn distinct_covers(tracks: &[Track], wanted: usize) -> Vec<String> {
     let mut covers: Vec<String> = Vec::with_capacity(wanted);
     for cover in tracks.iter().filter_map(|track| track.cover.as_deref()) {

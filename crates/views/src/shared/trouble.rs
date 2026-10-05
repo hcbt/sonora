@@ -38,7 +38,7 @@ pub(crate) fn trouble(failure: Failure, centered: bool) -> AnyElement {
 /// Whether a page built from `id` cannot be read at all because the network is gone. A local
 /// id never is, since nothing about it leaves the machine.
 pub(crate) fn unreachable(id: &str, cx: &App) -> bool {
-    !music::is_local_id(id) && Network::lost(cx)
+    !music::plays_from_disk(id) && Network::lost(cx)
 }
 
 /// The page-filling state for a screen that cannot load, with a button that tries again.

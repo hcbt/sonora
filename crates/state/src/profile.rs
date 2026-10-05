@@ -44,7 +44,7 @@ impl Profile {
                     cx.notify();
                 }
             }
-            SessionEvent::LocalChanged => {}
+            SessionEvent::LocalChanged | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

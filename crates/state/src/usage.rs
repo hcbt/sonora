@@ -92,7 +92,8 @@ impl Usage {
             SessionEvent::SignedIn(_) => this.connected(cx),
             SessionEvent::Reconnected(_)
             | SessionEvent::SignedOut(_)
-            | SessionEvent::LocalChanged => {}
+            | SessionEvent::LocalChanged
+            | SessionEvent::RekordboxChanged => {}
         })
         .detach();
 

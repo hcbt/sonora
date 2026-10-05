@@ -107,6 +107,20 @@ impl Detail {
                     }
                 }
             }
+            SessionEvent::RekordboxChanged => {
+                if let (Some(kind), Some(id)) = (
+                    this.kind,
+                    this.id
+                        .clone()
+                        .filter(|id| music::rekordbox::is_rekordbox_id(id)),
+                ) {
+                    this.clear();
+                    match kind {
+                        Collection::Album => this.open_album(&id, cx),
+                        Collection::Playlist => this.open_playlist(&id, cx),
+                    }
+                }
+            }
         })
         .detach();
 

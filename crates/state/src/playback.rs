@@ -271,6 +271,7 @@ pub enum Whence {
     Radio,
     Saved,
     Local,
+    Rekordbox,
 }
 
 /// The collection a queued track came from. While one of its tracks plays, its page shows a pause
@@ -315,6 +316,10 @@ impl Origin {
 
     pub fn local() -> Self {
         Self::of(Whence::Local, String::new())
+    }
+
+    pub fn rekordbox() -> Self {
+        Self::of(Whence::Rekordbox, String::new())
     }
 
     pub fn named(mut self, name: impl Into<SharedString>) -> Self {
@@ -362,6 +367,7 @@ pub struct Playback {
     track: Option<Track>,
     engines: HashMap<&'static str, Box<dyn Player>>,
     local_engine: Option<Box<dyn Player>>,
+    rekordbox_engine: Option<Box<dyn Player>>,
     session: Entity<Session>,
     owned: crate::owned::Owned,
     queue: Entity<Queue>,
@@ -454,6 +460,14 @@ impl Playback {
                 this.rebind(slug, playback, cx);
             }
             SessionEvent::SignedOut(slug) => this.drop_engine(slug, cx),
+            SessionEvent::RekordboxChanged => {
+                let Some(playback) = session.read(cx).rekordbox_playback() else {
+                    this.tasks.remove("rekordbox");
+                    this.rekordbox_engine = None;
+                    return;
+                };
+                this.start_rekordbox_engine(playback, cx);
+            }
             SessionEvent::LocalChanged => {
                 if this.local_engine.is_none()
                     && let Some(playback) = session.read(cx).local_playback()
@@ -503,6 +517,7 @@ impl Playback {
             dry: 0,
             tasks: HashMap::new(),
             local_task: None,
+            rekordbox_engine: None,
             load: None,
             fetch: None,
             enqueue: None,
@@ -541,14 +556,16 @@ impl Playback {
 
     /// The engine a track id belongs to: local files have their own.
     fn engine_for(&self, id: &str) -> Option<&dyn Player> {
-        match music::is_local_id(id) {
-            true => self.local_engine.as_deref(),
-            false => self
-                .owned
-                .slug(id)
-                .and_then(|slug| self.engines.get(slug))
-                .map(|engine| engine.as_ref()),
+        if music::is_local_id(id) {
+            return self.local_engine.as_deref();
         }
+        if music::rekordbox::is_rekordbox_id(id) {
+            return self.rekordbox_engine.as_deref();
+        }
+        self.owned
+            .slug(id)
+            .and_then(|slug| self.engines.get(slug))
+            .map(|engine| engine.as_ref())
     }
 
     fn active_engine(&self) -> Option<&dyn Player> {
@@ -566,13 +583,16 @@ impl Playback {
 
     /// Pauses every engine the new track does not belong to, so two accounts never sound at once.
     fn silence_other(&self, id: &str) {
-        let keep = match music::is_local_id(id) {
+        let keep_local = music::is_local_id(id);
+        let keep_rekordbox = music::rekordbox::is_rekordbox_id(id);
+        let keep = match keep_local || keep_rekordbox {
             true => None,
             false => self.owned.slug(id),
         };
-        if keep.is_some()
-            && let Some(engine) = self.local_engine.as_deref()
-        {
+        if !keep_local && let Some(engine) = self.local_engine.as_deref() {
+            engine.pause();
+        }
+        if !keep_rekordbox && let Some(engine) = self.rekordbox_engine.as_deref() {
             engine.pause();
         }
         for (slug, engine) in &self.engines {
@@ -630,8 +650,8 @@ impl Playback {
         let Some(id) = track.id.clone() else {
             return self.failed(format!("{} has no track id", track.name), cx);
         };
-        let is_local = music::is_local_id(&id);
-        if !is_local {
+        let on_disk = music::plays_from_disk(&id);
+        if !on_disk {
             match self.refused {
                 Some(Refusal::Keys) => return self.refuse(cx),
                 Some(Refusal::SignIn) => return self.gate(cx),
@@ -641,7 +661,7 @@ impl Playback {
         if !track.playable {
             return self.failed(format!("{} is not available to stream", track.name), cx);
         }
-        if !is_local && Network::lost(cx) {
+        if !on_disk && Network::lost(cx) {
             return self.unreachable(start, cx);
         }
         if self.engine_for(&id).is_none() {
@@ -1906,7 +1926,7 @@ impl Playback {
             Whence::Artist => self.play_artist_of(origin, cx),
             Whence::Radio => self.play_radio_of(origin, cx),
             // the table plays these
-            Whence::Saved | Whence::Local => {}
+            Whence::Saved | Whence::Local | Whence::Rekordbox => {}
         }
     }
 
@@ -2159,6 +2179,13 @@ impl Playback {
             self.local_engine = None;
             self.start_local_engine(playback, cx);
         }
+        if self.rekordbox_engine.is_some()
+            && let Some(playback) = self.session.read(cx).rekordbox_playback()
+        {
+            self.tasks.remove("rekordbox");
+            self.rekordbox_engine = None;
+            self.start_rekordbox_engine(playback, cx);
+        }
     }
 
     /// Rebuilds the engine of the current track on the new default audio device and reloads
@@ -2171,15 +2198,21 @@ impl Playback {
             return;
         };
         let at = self.live_position();
-        let local = music::is_local_id(&id);
         log::info!("playback: restarting after the audio output changed");
-        if local {
+        if music::is_local_id(&id) {
             let Some(playback) = self.session.read(cx).local_playback() else {
                 return;
             };
             self.local_task = None;
             self.local_engine = None;
             self.start_local_engine(playback, cx);
+        } else if music::rekordbox::is_rekordbox_id(&id) {
+            let Some(playback) = self.session.read(cx).rekordbox_playback() else {
+                return;
+            };
+            self.tasks.remove("rekordbox");
+            self.rekordbox_engine = None;
+            self.start_rekordbox_engine(playback, cx);
         } else {
             let Some(slug) = self.owned.slug(&id) else {
                 return;
@@ -2257,11 +2290,29 @@ impl Playback {
         self.refused = None;
         if self.track.is_none() {
             self.state = PlaybackState::Idle;
-            self.position = Duration::ZERO;
             self.clock.reset(Duration::ZERO, false);
         }
         self.prepare_resume(cx);
         cx.notify();
+    }
+
+    fn start_rekordbox_engine(
+        &mut self,
+        playback: Arc<dyn PlaybackFactory>,
+        cx: &mut Context<Self>,
+    ) {
+        let config = PlaybackConfig {
+            normalisation: self.normalisation,
+            gapless: self.gapless,
+            position_interval: POSITION_INTERVAL,
+            gain: gain(self.level),
+            equalizer: self.equalizer.clone(),
+        };
+        let (engine, events) = playback.start(config);
+        self.tasks.remove("rekordbox");
+        self.listen(events, Some("rekordbox"), cx);
+        self.rekordbox_engine = Some(engine);
+        self.prepare_resume(cx);
     }
 
     fn start_local_engine(&mut self, playback: Arc<dyn PlaybackFactory>, cx: &mut Context<Self>) {
@@ -2317,7 +2368,10 @@ impl Playback {
         let current = self.track.as_ref().and_then(|track| track.id.as_deref());
         let mine = match (from, current) {
             (None, Some(id)) => music::is_local_id(id),
-            (Some(slug), Some(id)) => !music::is_local_id(id) && self.owned.slug(id) == Some(slug),
+            (Some("rekordbox"), Some(id)) => music::rekordbox::is_rekordbox_id(id),
+            (Some(slug), Some(id)) => {
+                !music::plays_from_disk(id) && self.owned.slug(id) == Some(slug)
+            }
             _ => false,
         };
         if !mine {

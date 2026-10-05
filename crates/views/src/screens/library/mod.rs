@@ -12,8 +12,8 @@ use crate::shared::playlist_editor::{Edit, PlaylistEditor};
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, Entity, FontWeight, MouseButton, Pixels, Point, Render, ScrollHandle,
-    SharedString, WeakEntity, Window, div, point, px, relative,
+    AnyElement, App, Context, Entity, FontWeight, MouseButton, PathPromptOptions, Pixels, Point,
+    Render, ScrollHandle, SharedString, WeakEntity, Window, div, point, px, relative,
 };
 use i18n::t;
 use music::{Shape, Track};
@@ -96,6 +96,10 @@ impl Section {
             (Shelf::Local, Section::Albums) => "local-albums",
             (Shelf::Local, Section::Playlists) => "local-playlists",
             (Shelf::Local, Section::Artists) => "local-artists",
+            (Shelf::Rekordbox, Section::Songs) => "rekordbox-songs",
+            (Shelf::Rekordbox, Section::Albums) => "rekordbox-albums",
+            (Shelf::Rekordbox, Section::Playlists) => "rekordbox-playlists",
+            (Shelf::Rekordbox, Section::Artists) => "rekordbox-artists",
         }
     }
 
@@ -125,6 +129,10 @@ impl Section {
             (Shelf::Local, _, Section::Albums) => "library-no-local-albums",
             (Shelf::Local, _, Section::Playlists) => "library-no-local-playlists",
             (Shelf::Local, _, Section::Artists) => "library-no-local-artists",
+            (Shelf::Rekordbox, _, Section::Songs) => "library-no-rekordbox-songs",
+            (Shelf::Rekordbox, _, Section::Albums) => "library-no-rekordbox-albums",
+            (Shelf::Rekordbox, _, Section::Playlists) => "library-no-rekordbox-playlists",
+            (Shelf::Rekordbox, _, Section::Artists) => "library-no-rekordbox-artists",
             (Shelf::Account(_), Shape::Saved, Section::Songs) => "library-no-songs",
             (Shelf::Account(_), Shape::Saved, Section::Albums) => "library-no-albums",
             (Shelf::Account(_), Shape::Saved, Section::Artists) => "library-no-artists",
@@ -159,6 +167,7 @@ fn origin(shelf: Shelf) -> Origin {
     match shelf {
         Shelf::Account(_) => Origin::saved(),
         Shelf::Local => Origin::local(),
+        Shelf::Rekordbox => Origin::rekordbox(),
     }
 }
 
@@ -490,9 +499,29 @@ impl LibraryView {
     /// recorded once its scan lands, so the setup screen would otherwise cover the whole of the
     /// first import, which is the longest one there is.
     fn unconfigured(&self, cx: &App) -> bool {
-        self.shelf.local()
-            && Sonora::global(cx).session.read(cx).local_paths().is_empty()
-            && Scan::global(cx).read(cx).progress().is_none()
+        match self.shelf {
+            Shelf::Local => {
+                Sonora::global(cx).session.read(cx).local_paths().is_empty()
+                    && Scan::global(cx).read(cx).progress().is_none()
+            }
+            Shelf::Rekordbox => Sonora::global(cx)
+                .session
+                .read(cx)
+                .rekordbox_path()
+                .is_none(),
+            Shelf::Account(_) => false,
+        }
+    }
+
+    fn rekordbox_error(&self, cx: &App) -> Option<String> {
+        if !self.shelf.rekordbox() {
+            return None;
+        }
+        Sonora::global(cx)
+            .session
+            .read(cx)
+            .rekordbox_error()
+            .map(str::to_owned)
     }
 
     /// What an empty local page says while a scan is filling it. The page is not empty, it is
@@ -611,6 +640,9 @@ impl LibraryView {
             match (self.shape(cx), self.shelf) {
                 (Shape::Catalog, Shelf::Local) => {
                     (t!("nav-songs"), "icons/disc-3.svg", t!("nav-local"))
+                }
+                (Shape::Catalog, Shelf::Rekordbox) => {
+                    (t!("nav-songs"), "icons/disc-3.svg", t!("nav-rekordbox"))
                 }
                 (Shape::Catalog, Shelf::Account(slug)) => (
                     t!("nav-songs"),
@@ -1095,7 +1127,17 @@ impl Render for LibraryView {
         let view = cx.entity().downgrade();
         let section = self.section;
         let note = self.note(cx);
+        let read_only = self.shelf.rekordbox();
         let content = match (self.section, mode) {
+            _ if self.rekordbox_error(cx).is_some() => {
+                Vacancy::new(self.rekordbox_error(cx).unwrap_or_default())
+                    .icon("icons/folder-plus.svg")
+                    .size_full()
+                    .into_any_element()
+            }
+            _ if self.unconfigured(cx) && self.shelf.rekordbox() => {
+                rekordbox_unconfigured().size_full().into_any_element()
+            }
             _ if self.unconfigured(cx) => local::unconfigured("configure-local-folder")
                 .size_full()
                 .into_any_element(),
@@ -1123,7 +1165,7 @@ impl Render for LibraryView {
             .relative()
             .size_full()
             .on_mouse_down(MouseButton::Right, move |event, window, cx| {
-                if section != Section::Playlists {
+                if section != Section::Playlists || read_only {
                     return;
                 }
                 window.prevent_default();
@@ -1206,7 +1248,7 @@ impl Tooled for LibraryView {
         });
 
         let created = self.me.clone();
-        let create = (self.section == Section::Playlists).then(|| {
+        let create = (self.section == Section::Playlists && !self.shelf.rekordbox()).then(|| {
             Button::new("new-playlist")
                 .icon("icons/plus.svg")
                 .tooltip("menu-new-playlist")
@@ -1340,6 +1382,39 @@ fn deck_heights(rows: &[DeckRow], tile: Pixels, heading: Pixels) -> Vec<Pixels> 
             DeckRow::Cards(_) => tile,
         })
         .collect()
+}
+
+fn rekordbox_unconfigured() -> Vacancy {
+    Vacancy::new(t!("library-rekordbox-unconfigured"))
+        .icon("icons/folder-plus.svg")
+        .action(
+            Button::new("configure-rekordbox")
+                .label(t!("settings-choose-folder"))
+                .outline()
+                .on_click(|_, _, cx| choose_rekordbox(cx)),
+        )
+}
+
+fn choose_rekordbox(cx: &mut App) {
+    let receiver = cx.prompt_for_paths(PathPromptOptions {
+        files: false,
+        directories: true,
+        multiple: false,
+        prompt: None,
+    });
+    let library = Sonora::global(cx).library.clone();
+    cx.spawn(async move |cx| {
+        let Ok(Ok(Some(paths))) = receiver.await else {
+            return;
+        };
+        let Some(path) = paths.into_iter().next() else {
+            return;
+        };
+        library.update(cx, |library, cx| {
+            library.set_rekordbox_folder(Some(path), cx)
+        });
+    })
+    .detach();
 }
 
 #[cfg(test)]

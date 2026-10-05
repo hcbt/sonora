@@ -53,6 +53,10 @@ time.workspace = true
 tokio.workspace = true
 widevine.workspace = true
 ytmusic.workspace = true
+aes.workspace = true
+hmac.workspace = true
+pbkdf2.workspace = true
+sha1.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true
