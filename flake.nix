@@ -97,6 +97,14 @@
               "${pkgs.alsa-plugins}/lib/alsa-lib"
             ];
           };
+          # gpui_apple compiles its shaders with `xcrun -sdk macosx metal` at build
+          # time. The Nix Apple SDK has no Metal toolchain, so hand xcrun back to the
+          # installed Xcode, same as devShells' xcodeXcrun. Needs host Xcode and an
+          # unsandboxed build (`sandbox = false`): a pure builder has no /usr/bin.
+          xcodeXcrun = pkgs.runCommandLocal "xcode-xcrun" { } ''
+            mkdir -p $out/bin
+            ln -s /usr/bin/xcrun $out/bin/xcrun
+          '';
 
           sonora = pkgs.rustPlatform.buildRustPackage (final: {
             pname = "sonora";
@@ -118,19 +126,7 @@
                   mold
                 ])
                 (lib.optionals stdenv.hostPlatform.isDarwin [
-                  (
-                    let
-                      pkgs' = import nixpkgs {
-                        inherit (stdenv.hostPlatform) system;
-                        config.allowUnfree = true;
-                      };
-                    in
-                    runCommandLocal "metal-shader-compiler" { } ''
-                      mkdir -p "$out/bin"
-                      ln -s ${pkgs'.darwin.xcode}/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/metal "$out/bin/metal"
-                      ln -s ${pkgs'.darwin.xcode}/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/metallib "$out/bin/metallib"
-                    ''
-                  )
+                  xcodeXcrun
                 ])
               ];
             buildInputs =
@@ -164,14 +160,34 @@
                 wayland
               ];
 
+            preConfigure =
+              lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''
+                # See xcodeXcrun: point xcrun at the installed Xcode. Clang follows
+                # DEVELOPER_DIR too and then reads Xcode's C headers beside the Nix
+                # libc++, which breaks any C++ a build script compiles, so C++
+                # compiles are pinned to the Nix SDK through CXXFLAGS.
+                # xcode-select echoes DEVELOPER_DIR back when it is set, so ask with it unset.
+                if xcode="$(env -u DEVELOPER_DIR /usr/bin/xcode-select -p 2>/dev/null)"; then
+                  export DEVELOPER_DIR="$xcode"
+                  export CXXFLAGS="''${CXXFLAGS:-} -isysroot $SDKROOT"
+                else
+                  echo "sonora: cannot locate Xcode (xcode-select -p failed); install Xcode to build on Darwin" >&2
+                  exit 1
+                fi
+              '';
+
             installPhase = ''
               runHook preInstall
 
-              install -Dm755 target/release/sonora "$out/bin/sonora"
+              # cargoBuildHook passes --target on Darwin, so the binary lands under
+              # target/<triple>/release instead of target/release.
+              bin="target/release/sonora"
+              ${lib.optionalString pkgs.stdenv.hostPlatform.isDarwin ''bin="target/${pkgs.stdenv.hostPlatform.rust.rustcTarget}/release/sonora"''}
+              install -Dm755 "$bin" "$out/bin/sonora"
               ${
                 if pkgs.stdenv.hostPlatform.isDarwin then
                   ''
-                    install -Dm755 target/release/sonora "$out/Applications/Sonora.app/Contents/MacOS/sonora"
+                    install -Dm755 "$bin" "$out/Applications/Sonora.app/Contents/MacOS/sonora"
                     install -Dm444 "$src/assets/macos/sonora.icns" \
                       "$out/Applications/Sonora.app/Contents/Resources/sonora.icns"
 
@@ -306,8 +322,6 @@
         }
         // lib.optionalAttrs (builtins.hasAttr pkgs.stdenv.hostPlatform.system release.assets) {
           inherit sonora-bin;
-          sonora = sonora-bin;
-          default = sonora-bin;
         }
       );
 
