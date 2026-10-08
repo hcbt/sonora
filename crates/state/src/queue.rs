@@ -423,13 +423,13 @@ impl Queue {
             let session = self.session.read(cx);
             self.current
                 .as_ref()
-                .and_then(|track| track.id.as_deref())
+                .and_then(|track| track.id())
                 .and_then(|id| session.slug_for(id))
                 .or_else(|| {
                     self.past
                         .iter()
                         .chain(self.upcoming.iter())
-                        .find_map(|track| track.id.as_deref().and_then(|id| session.slug_for(id)))
+                        .find_map(|track| track.id().and_then(|id| session.slug_for(id)))
                 })
         };
         let mut resume = slug.map(|slug| {
@@ -496,7 +496,7 @@ impl Queue {
                 .chain(self.current.as_ref())
                 .chain(self.upcoming.iter())
                 .chain(self.source.iter())
-                .filter_map(|track| track.id.clone())
+                .filter_map(|entry| entry.track.id.clone())
                 .filter(|id| session.slug_for(id) == Some(slug))
                 .collect()
         };
