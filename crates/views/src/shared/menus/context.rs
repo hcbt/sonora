@@ -1461,12 +1461,10 @@ fn share_link(kind: MediaKind, id: Option<&str>, cx: &App) -> Result<String, &'s
             false => "menu-copy-link-none",
         });
     };
-    client
-        .share_url(kind, id)
-        .ok_or(match local {
-            true => "menu-copy-link-local",
-            false => "menu-copy-link-none",
-        })
+    client.share_url(kind, id).ok_or(match local {
+        true => "menu-copy-link-local",
+        false => "menu-copy-link-none",
+    })
 }
 
 /// The menu behind the playlists of a library page. A local shelf also offers to import an

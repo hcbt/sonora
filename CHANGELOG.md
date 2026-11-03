@@ -20,6 +20,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Tidal tracks show their bit depth or bit rate in the signal path.
 - Keep plays from the signed-in provider out of Last.fm and the other linked services with a switch in Scrobbling, for accounts that already scrobble on their own.
 - Sonora's app icon follows the dark, clear and tinted icon styles on macOS 26 and later.
+- Play a rekordbox library, including its playlists. Set the library folder under Settings,
+  next to your music folders. Create, rename and delete its playlists, and add or remove
+  tracks. Close rekordbox first; the change is in its library, so it is there when rekordbox
+  opens.
+- Each library lists its playlists in the sidebar. Open the Playlists row to see them, and
+  drop a track from that same library on one to add it, even if the track is not saved yet.
+- Search says which library it is searching, and the picker next to the field switches it.
+  Albums and playlists are listed in their own columns.
+- Spotify, YouTube Music and the other accounts can stay signed in together. Each one has its
+  own library in the sidebar, next to Local Music, and search, home and playback use whichever
+  account the song belongs to.
+- A song page lists a track's BPM and key when Spotify or the file knows them, including the
+  Camelot code Spotify shows beside the key.
+- Track lists have BPM and Key columns, filled from that same analysis. Turn them on from the
+  column menu.
 
 ### Changed
 
@@ -54,6 +69,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Mixed English and Japanese lyrics no longer show duplicate English romanizations or misplaced spaces inside parentheses.
 - With Spotify, lyrics and the progress bar no longer run ahead of the music.
+- Right-click the Rekordbox playlists page to create a playlist.
+- Rekordbox tracks show the artwork stored with the library.
+- Turning on the BPM or Key column keeps it on the track list, including when the songs have no
+  tempo or key yet.
 
 ## [0.48.1] - 2026-11-08
 
@@ -633,31 +652,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Press F11 or double-click the fullscreen view to make the window fill the whole screen. Turn on
   Use OS fullscreen in settings to have the fullscreen button do the same.
-- Play a rekordbox library, including its playlists. Set the library folder under Settings,
-  next to your music folders. Create, rename and delete its playlists, and add or remove
-  tracks. Close rekordbox first; the change is in its library, so it is there when rekordbox
-  opens.
-- Each library lists its playlists in the sidebar. Open the Playlists row to see them, and
-  drop a track from that same library on one to add it, even if the track is not saved yet.
-- Search says which library it is searching, and the picker next to the field switches it.
-  Albums and playlists are listed in their own columns.
-- Spotify, YouTube Music and the other accounts can stay signed in together. Each one has its
-  own library in the sidebar, next to Local Music, and search, home and playback use whichever
-  account the song belongs to.
 - AIFF files in a local library now show up and play, including `.aif` and `.aifc`. Opening one
   from the file manager works too.
-- A song page lists a track's BPM and key when Spotify or the file knows them, including the
-  Camelot code Spotify shows beside the key.
-- Track lists have BPM and Key columns, filled from that same analysis. Turn them on from the
-  column menu.
-
-### Fixed
-
-- Right-click the Rekordbox playlists page to create a playlist.
-- Rekordbox tracks show the artwork stored with the library.
-
-- Turning on the BPM or Key column keeps it on the track list, including when the songs have no
-  tempo or key yet.
 
 ### Fixed
 

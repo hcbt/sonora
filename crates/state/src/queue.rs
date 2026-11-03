@@ -544,7 +544,11 @@ impl Queue {
                         .iter()
                         .chain(self.upcoming.iter())
                         .find_map(|entry| {
-                            entry.track.id.as_deref().and_then(|id| session.slug_for(id))
+                            entry
+                                .track
+                                .id
+                                .as_deref()
+                                .and_then(|id| session.slug_for(id))
                         })
                 })
         };

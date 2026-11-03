@@ -323,7 +323,12 @@ impl TrackSource {
         let Some(shelf) = Sonora::global(cx).session.read(cx).shelf_for(id) else {
             return Numbering::Listing;
         };
-        if !Sonora::global(cx).library.read(cx).shape(shelf).is_catalog() {
+        if !Sonora::global(cx)
+            .library
+            .read(cx)
+            .shape(shelf)
+            .is_catalog()
+        {
             return Numbering::Listing;
         }
 

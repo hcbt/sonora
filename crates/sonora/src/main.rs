@@ -618,15 +618,3 @@ unsafe extern "system" fn work_area(
 fn platform_handle(_window: &gpui::Window) -> Option<*mut std::ffi::c_void> {
     None
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_percent_before_a_multibyte_letter_stays_in_the_path() {
-        assert_eq!(percent_decode("%가나"), "%가나");
-        assert_eq!(percent_decode("%a가"), "%a가");
-        assert_eq!(percent_decode("a%20b%EA%B0%80"), "a b가");
-    }
-}

@@ -981,7 +981,6 @@ impl Session {
     }
 
     fn signed_in(&mut self, session: ProviderSession, index: usize, cx: &mut Context<Self>) {
-
         let slug = self.providers[index].slug();
         let replaced = self.lives.iter().any(|live| live.index == index);
         if replaced {

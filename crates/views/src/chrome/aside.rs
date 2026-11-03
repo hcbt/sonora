@@ -17,8 +17,8 @@ use music::{Contributor, Shape, Track, Voice};
 use router::{Destination, LibraryTab, Link as _};
 use state::{
     AppSettings, Lyrics, LyricsState, Network, Playback, PlaybackState, Queue, QueuePosition,
-    QueueSections as Sections, QueueSlot as Slot, QueueView, RomanizationScripts, SideTab,
-    Sonora, Whence,
+    QueueSections as Sections, QueueSlot as Slot, QueueView, RomanizationScripts, SideTab, Sonora,
+    Whence,
 };
 use ui::{
     ActiveTheme as _, Avatar, Button, Card, DraggedPin, Edge, Glowing as _, Initials, Motion,

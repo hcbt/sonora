@@ -576,8 +576,11 @@ impl Playback {
         // An engine can run a program of its own, as Soloist does. Letting go of the engine
         // stops it, and the app waits for that before it is gone.
         cx.on_app_quit(|this, _| {
-            this.task = None;
-            this.engine = None;
+            this.engines.clear();
+            this.tasks.clear();
+            this.local_engine = None;
+            this.local_task = None;
+            this.rekordbox_engine = None;
             music::soloist::stopped()
         })
         .detach();
@@ -3432,12 +3435,7 @@ impl Playback {
                  until you sign in"
             );
         }
-        Toasts::about(
-            Outcome::Failed,
-            "toast-sign-in-to-play",
-            provider.to_owned(),
-            cx,
-        );
+        Toasts::about(Outcome::Failed, "toast-sign-in-to-play", provider, cx);
         cx.notify();
     }
 

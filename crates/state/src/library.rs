@@ -2175,9 +2175,7 @@ impl Library {
                     },
                     cx,
                 );
-                if bare
-                    && let Shelf::Account(slug) = shelf
-                {
+                if bare && let Shelf::Account(slug) = shelf {
                     this.build_mosaics(slug, cx);
                 }
                 cx.emit(LibraryEvent::PlaylistChanged(changed));
@@ -3178,14 +3176,10 @@ impl Library {
                 // a failed read leaves the playlists on screen as they were, with no problem
                 // noted that only a full refresh would clear
                 match loaded {
-                    Ok(playlists) => {
-                        this.land(shelf, Landed::Playlists(Ok(playlists)), cx)
-                    }
+                    Ok(playlists) => this.land(shelf, Landed::Playlists(Ok(playlists)), cx),
                     Err(error) => {
                         log::warn!("library: cannot read the changed playlists: {error:#}");
-                        this.held_mut(shelf)
-                            .stale
-                            .remove(&LibraryPart::Playlists);
+                        this.held_mut(shelf).stale.remove(&LibraryPart::Playlists);
                     }
                 }
             },

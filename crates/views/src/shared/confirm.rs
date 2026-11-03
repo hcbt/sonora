@@ -104,7 +104,11 @@ impl Confirm {
         let Some(shelf) = Sonora::global(cx).session.read(cx).shelf_for(id) else {
             return false;
         };
-        Sonora::global(cx).library.read(cx).shape(shelf).is_catalog()
+        Sonora::global(cx)
+            .library
+            .read(cx)
+            .shape(shelf)
+            .is_catalog()
     }
 
     pub fn ask(kind: Kind, apply: impl FnOnce(&mut App) + 'static, cx: &mut App) {

@@ -9,8 +9,8 @@ use ui::{
 use gpui::accesskit::Role;
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, App, Context, DragMoveEvent, Entity, MouseButton, MouseDownEvent,
-    Pixels, Point, Render, ScrollHandle, SharedString, svg,
+    AnyElement, App, Context, DragMoveEvent, Entity, MouseButton, MouseDownEvent, Pixels, Point,
+    Render, ScrollHandle, SharedString, svg,
 };
 use gpui::{Window, div, px};
 use music::Shape;
@@ -927,7 +927,8 @@ impl SidebarLeft {
     fn accepts(&self, song: &Pin, target: &Pin, cx: &App) -> bool {
         song.kind == PinKind::Song
             && target.kind == PinKind::Playlist
-            && self.session.read(cx).shelf_of(&song.id) == self.session.read(cx).shelf_of(&target.id)
+            && self.session.read(cx).shelf_of(&song.id)
+                == self.session.read(cx).shelf_of(&target.id)
             && self.library.read(cx).is_editable(&target.id)
     }
 

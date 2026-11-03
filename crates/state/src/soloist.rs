@@ -100,8 +100,8 @@ impl EventEmitter<SoloistSwitched> for Soloist {}
 impl Soloist {
     pub fn new(session: Entity<Session>, io: Io, cx: &mut Context<Self>) -> Self {
         cx.subscribe(&session, |this, session, event, cx| match event {
-            SessionEvent::SignedIn if session.read(cx).offers_soloist() => this.look(cx),
-            SessionEvent::SignedOut => this.close(cx),
+            SessionEvent::SignedIn(_) if session.read(cx).offers_soloist() => this.look(cx),
+            SessionEvent::SignedOut(_) => this.close(cx),
             _ => {}
         })
         .detach();

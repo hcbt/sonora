@@ -16,7 +16,8 @@ use gpui::accesskit::Role;
 use gpui::prelude::*;
 use gpui::{
     AnyElement, App, Context, ElementId, Entity, FontWeight, MouseButton, PathPromptOptions,
-    Pixels, Point, Render, ScrollHandle, SharedString, WeakEntity, Window, div, point, px, relative,
+    Pixels, Point, Render, ScrollHandle, SharedString, WeakEntity, Window, div, point, px,
+    relative,
 };
 use i18n::t;
 use music::{Shape, Track};
@@ -141,7 +142,9 @@ impl Section {
             (Shelf::Account(_), Shape::Saved, Section::Artists) => "library-no-artists",
             (Shelf::Account(_), Shape::Catalog(_), Section::Songs) => "library-no-catalog-songs",
             (Shelf::Account(_), Shape::Catalog(_), Section::Albums) => "library-no-catalog-albums",
-            (Shelf::Account(_), Shape::Catalog(_), Section::Artists) => "library-no-catalog-artists",
+            (Shelf::Account(_), Shape::Catalog(_), Section::Artists) => {
+                "library-no-catalog-artists"
+            }
             (Shelf::Account(_), _, Section::Playlists) => "library-no-playlists",
         }
     }

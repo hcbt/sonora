@@ -22,8 +22,8 @@ use ui::ActiveTheme as _;
 use ui::{
     Activate, Button, Card, Deck, Deselect, Dismiss, Dropdown, MenuItem, Picker, Pinnable,
     Popovers, Popup, Room, Scrollbar, Scroller, SelectLeft, SelectNext, SelectPrevious,
-    SelectRight, Separator, Submit, Text, Theme, VAST, clock, eyebrow, scrolled, snapped,
-    tabular, vacant,
+    SelectRight, Separator, Submit, Text, Theme, VAST, clock, eyebrow, scrolled, snapped, tabular,
+    vacant,
 };
 
 use crate::shared::cards;
@@ -1190,7 +1190,11 @@ impl SearchView {
             Kind::Song => ("search-songs-heading", t!("search-songs"), SONGS),
             Kind::Artist => ("search-artists-heading", t!("search-artists"), ARTISTS),
             Kind::Album => ("search-albums-heading", t!("search-albums"), ALBUMS),
-            Kind::Playlist => ("search-playlists-heading", t!("search-playlists"), PLAYLISTS),
+            Kind::Playlist => (
+                "search-playlists-heading",
+                t!("search-playlists"),
+                PLAYLISTS,
+            ),
         };
         let body = self.deck(only, RAIL, None, title.clone(), window, cx);
 
